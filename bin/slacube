@@ -151,7 +151,6 @@ make_workdir()
 	[[ $? -eq 0 ]] || die "Error: Fail to crate working directory!"
   cat >"$workdir/setup.sh" <<-_EOF
 		export SLACUBE_WORKDIR="$workdir"
-		alias slacube-cd="cd $workdir"
 	_EOF
 
 	cat <<-_EOF
@@ -235,12 +234,13 @@ adjust_trim_threshold()
 # ====================================
 cmd_env()
 {
+  cd ${SLACUBE_DEFAULT_WORKDIR-./} 
 	case "$1" in
 		create) shift;
 			make_workdir "$@"
 			;;
 		last) shift;
-			local n=$(find ${SLACUBE_DEFAULT_WORKDIR} -maxdepth 1 -type d | wc -l)
+			local n=$(find . -maxdepth 1 -type d | wc -l)
 			if [[ $n -eq 1 ]]
 			then
 				cat >&2 <<-_EOF
@@ -252,9 +252,8 @@ cmd_env()
 				exit 1
 			fi
 
-			#TODO (2023-03-27 kvt) option to select workdir
-			local fpath="$(ls -dt ${SLACUBE_DEFAULT_WORKDIR}/* | head -n1)/setup.sh"
-			[[ -f "$fpath" ]]  && echo $fpath  || die "Error: setup.sh not found"
+			local fpath="$(ls -t | head -n1)/setup.sh"
+      [[ -f "$fpath" ]]  && echo $(realpath $fpath)  || die "Error: setup.sh not found"
 			;;
     help) shift; show_help env;;
 		*) echo "Usage: $PROGRAM env [create|last|help]" ;;
