@@ -239,7 +239,7 @@ cmd_env()
 		create) shift;
 			make_workdir "$@"
 			;;
-		last) shift;
+		curr) shift;
 			local n=$(find . -maxdepth 1 -type d | wc -l)
 			if [[ $n -eq 1 ]]
 			then
@@ -259,7 +259,7 @@ cmd_env()
       find $PWD -maxdepth 2 -type f -name setup.sh
       ;;
     help) shift; show_help env;;
-		*) echo "Usage: $PROGRAM env [create|last|list|help]" ;;
+		*) echo "Usage: $PROGRAM env [create|curr|list|help]" ;;
 	esac
 }
 

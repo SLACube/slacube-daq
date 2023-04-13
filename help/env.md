@@ -4,7 +4,7 @@ NAME
 
 SYNOPSIS
 ========
-**slacube env [ create | last | help ]**
+**slacube env [ create | curr | list| help ]**
 
 DESCRIPTION
 ===========
@@ -15,8 +15,11 @@ COMMAND
 create [_NAME_]
 :   Create a working directory under `$SLACUBE_DEFAULT_WORKDIR`.
 
-last
+curr
 :   Print the setup script for the most recent (by modification time) working directory.
+
+list
+:   List all available setup scripts.
 
 help
 :   Show this text.
