@@ -71,12 +71,12 @@ check_rc()
 			_EOF
       exit 1
       ;;
-    BLACKLIST_FILE)
+    BAD_CHANNEL_FILE)
 			cat >&2 <<-_EOF
 			Error: bad channels list not set/found.
 
 			Try:
-			   > slacube blacklist set [file]
+			   > slacube bad-channel set [file]
 			_EOF
       exit 1
       ;;
@@ -145,8 +145,8 @@ make_workdir()
 		&& RC_LOCAL="${workdir}/.slacuberc" \
 		&& touch "$RC_LOCAL" \
     && cp -r ${SLACUBE_QC_SCRIPTS}/io . \
-		&& cp ${SLACUBE_QC_SCRIPTS}/bad_channels.json $workdir/blacklist_default.json \
-		&& write_rc BLACKLIST_FILE $workdir/blacklist_default.json 
+		&& cp ${SLACUBE_QC_SCRIPTS}/bad_channels.json $workdir/bad-channel_default.json \
+		&& write_rc BAD_CHANNEL_FILE $workdir/bad-channel_default.json 
 
 	[[ $? -eq 0 ]] || die "Error: Fail to crate working directory!"
   cat >"$workdir/setup.sh" <<-_EOF
@@ -297,10 +297,10 @@ cmd_rate_test()
   case "$1" in
     start) shift;
 			check_rc CTRL_FILE
-			check_rc BLACKLIST_FILE
+			check_rc BAD_CHANNEL_FILE
       python "${SLACUBE_QC_SCRIPTS}/trigger_rate_qc.py" \
 				--controller_config $(read_rc CTRL_FILE) \
-				--disabled_list $(read_rc BLACKLIST_FILE) \
+				--disabled_list $(read_rc BAD_CHANNEL_FILE) \
 				"$@"
       ;;
     help) shift; show_help rate-test;;
@@ -308,7 +308,7 @@ cmd_rate_test()
   esac
 }
 
-cmd_blacklist()
+cmd_bad_channel()
 {
   cd $SLACUBE_WORKDIR
 	case "$1" in
@@ -316,23 +316,23 @@ cmd_blacklist()
 			local fpath
 			[[ $# -eq 0 ]] && fpath="$(ls -t *.json | fzf)" || fpath="$@"
 			[[ ! -f $fpath ]] && die "Error: file not found"
-			write_rc BLACKLIST_FILE $(realpath "$fpath")
+			write_rc BAD_CHANNEL_FILE $(realpath "$fpath")
 			;;
     copy) shift;
-			check_rc BLACKLIST_FILE
+			check_rc BAD_CHANNEL_FILE
       local fpath="bad_channels-$(hex_now).json"
-      cp -r "$(read_rc BLACKLIST_FILE)" "$fpath" \
-        && write_rc BLACKLIST_FILE $(realpath "$fpath") \
-        || die "Error: fail to copy blacklist"
+      cp -r "$(read_rc BAD_CHANNEL_FILE)" "$fpath" \
+        && write_rc BAD_CHANNEL_FILE $(realpath "$fpath") \
+        || die "Error: fail to copy bad-channel"
       ;;
     add) shift;
-			check_rc BLACKLIST_FILE
-			local fpath=$(read_rc BLACKLIST_FILE)
+			check_rc BAD_CHANNEL_FILE
+			local fpath=$(read_rc BAD_CHANNEL_FILE)
 			yes_no "Overwriting ${fpath}?"
       slacube-mask-channel.py "$fpath" "$@"
       ;;
-    help) shift; show_help blacklist ;;
-		*) echo "Usage: $PROGRAM blacklist [set|copy|add|help]" ;;
+    help) shift; show_help bad-channel ;;
+		*) echo "Usage: $PROGRAM bad-channel [set|copy|add|help]" ;;
 	esac
 }
 
@@ -342,19 +342,19 @@ cmd_pedestal()
 	case "$1" in
 		start) shift;
 			check_rc CTRL_FILE
-			check_rc BLACKLIST_FILE
+			check_rc BAD_CHANNEL_FILE
       python "${SLACUBE_QC_SCRIPTS}/pedestal_qc.py" \
 				--controller_config $(read_rc CTRL_FILE) \
-				--disabled_list $(read_rc BLACKLIST_FILE) \
+				--disabled_list $(read_rc BAD_CHANNEL_FILE) \
         --no_refinement --no_log_simple \
 				"$@"
 			;;
 		start-qc) shift;
 			check_rc CTRL_FILE
-			check_rc BLACKLIST_FILE
+			check_rc BAD_CHANNEL_FILE
       python "${SLACUBE_QC_SCRIPTS}/pedestal_qc.py" \
 				--controller_config $(read_rc CTRL_FILE) \
-				--disabled_list $(read_rc BLACKLIST_FILE) \
+				--disabled_list $(read_rc BAD_CHANNEL_FILE) \
 				"$@"
 			;;
 		plot) shift;
@@ -394,7 +394,7 @@ cmd_threshold()
       ;;
     start) shift;
 			check_rc CTRL_FILE
-			check_rc BLACKLIST_FILE
+			check_rc BAD_CHANNEL_FILE
       check_rc PEDESTAL_FILE
 
       local cfg_dir
@@ -411,7 +411,7 @@ cmd_threshold()
 
       python "${SLACUBE_QC_SCRIPTS}/threshold_qc.py" \
 				--controller_config $(read_rc CTRL_FILE) \
-				--disabled_list $(read_rc BLACKLIST_FILE) \
+				--disabled_list $(read_rc BAD_CHANNEL_FILE) \
         --pedestal_file $(read_rc PEDESTAL_FILE) \
         --outdir "$cfg_dir" \
 				"$@" \
@@ -454,12 +454,12 @@ cmd_selftrig()
   case "$1" in
     start) shift;
 			check_rc CTRL_FILE
-			check_rc BLACKLIST_FILE
+			check_rc BAD_CHANNEL_FILE
       check_rc CFG_DIR
 
       python "${SLACUBE_QC_SCRIPTS}/selftrigger_qc.py" \
 				--controller_config $(read_rc CTRL_FILE) \
-				--disabled_list $(read_rc BLACKLIST_FILE) \
+				--disabled_list $(read_rc BAD_CHANNEL_FILE) \
         --config_name $(read_rc CFG_DIR)  \
         "$@"
       ;;
@@ -492,7 +492,7 @@ cmd_pedmon()
   case "$1" in
     start) shift;
       check_rc CTRL_FILE
-      check_rc BLACKLIST_FILE
+      check_rc BAD_CHANNEL_FILE
 
 			[[ $# -ne 0 && $# -ne 2 ]] && die "Usage: $PROGRAM ped-mon [runtime] [trig_cycle]"
 			local runtime=${1-600}
@@ -509,7 +509,7 @@ cmd_pedmon()
 
         python "${SLACUBE_QC_SCRIPTS}/pedestal_qc.py" \
           --controller_config $(read_rc CTRL_FILE) \
-          --disabled_list $(read_rc BLACKLIST_FILE) \
+          --disabled_list $(read_rc BAD_CHANNEL_FILE) \
           --runtime $runtime \
           --periodic_trigger_cycles $cycles\
           --outdir $tmp \
@@ -549,7 +549,7 @@ cmd_run()
   case "$1" in
     start) shift;
 			check_rc CTRL_FILE
-			check_rc BLACKLIST_FILE
+			check_rc BAD_CHANNEL_FILE
       check_rc CFG_DIR
 			check_dropbox
 
@@ -571,7 +571,7 @@ cmd_run()
 
         python "${SLACUBE_QC_SCRIPTS}/pedestal_qc.py" \
 				  --controller_config $(read_rc CTRL_FILE) \
-				  --disabled_list $(read_rc BLACKLIST_FILE) \
+				  --disabled_list $(read_rc BAD_CHANNEL_FILE) \
           --runtime $ped_runtime \
           --outdir $tmp \
           --no_refinement --no_log_simple \
@@ -585,7 +585,7 @@ cmd_run()
 
           python "${SLACUBE_QC_SCRIPTS}/selftrigger_qc.py" \
             --controller_config $(read_rc CTRL_FILE) \
-            --disabled_list $(read_rc BLACKLIST_FILE) \
+            --disabled_list $(read_rc BAD_CHANNEL_FILE) \
             --config_name $(read_rc CFG_DIR)  \
             --outdir $tmp --runtime $selftrig_runtime
 
@@ -607,7 +607,7 @@ cmd_cfg()
   case "$1" in
     archive) shift;
       check_rc CTRL_FILE
-      check_rc BLACKLIST_FILE
+      check_rc BAD_CHANNEL_FILE
       check_rc CFG_DIR
       check_git
 
@@ -642,7 +642,7 @@ cmd_cfg()
 			yes_no "Commit?"
 
 			mkdir -p $outdir || die "Error: fail to create archive directory"
-			cp -r "$cfg" "$(read_rc CTRL_FILE)" "$(read_rc BLACKLIST_FILE)" "$outdir" \
+			cp -r "$cfg" "$(read_rc CTRL_FILE)" "$(read_rc BAD_CHANNEL_FILE)" "$outdir" \
 				|| die "Error: fail to copy files"
 			git -C "$SLACUBE_GIT_DIR"  add "$outdir" \
 				&& git -C "$SLACUBE_GIT_DIR" commit -m "${author}: ${comment}" \
@@ -663,18 +663,18 @@ cmd_cfg()
 [[ $# -eq 0 || "$1" == "env" || "$1" == "help" ]] || check_workdir
 
 case "$1" in
-	env)        shift; cmd_env "$@"       ;;
-  hydra)      shift; cmd_hydra "$@"     ;;
-  rate-test)  shift; cmd_rate_test "$@" ;;
-  blacklist)  shift; cmd_blacklist "$@" ;;
-  pedestal)   shift; cmd_pedestal "$@"  ;;
-  threshold)  shift; cmd_threshold "$@" ;;
-  selftrig)   shift; cmd_selftrig "$@"  ;;
-  ped-mon)    shift; cmd_pedmon "$@"    ;;
-  run)        shift; cmd_run "$@"       ;;
-  cfg)        shift; cmd_cfg "$@"       ;;
-  help)       shift; show_help slacube  ;;
-  *)          echo "Usage: $PROGRAM"    ;;
+  env)         shift; cmd_env "$@"       ;;
+  hydra)       shift; cmd_hydra "$@"     ;;
+  rate-test)   shift; cmd_rate_test "$@" ;;
+  bad-channel) shift; cmd_bad_channel "$@" ;;
+  pedestal)    shift; cmd_pedestal "$@"  ;;
+  threshold)   shift; cmd_threshold "$@" ;;
+  selftrig)    shift; cmd_selftrig "$@"  ;;
+  ped-mon)     shift; cmd_pedmon "$@"    ;;
+  run)         shift; cmd_run "$@"       ;;
+  cfg)         shift; cmd_cfg "$@"       ;;
+  help)        shift; show_help slacube  ;;
+  *)           echo "Usage: $PROGRAM"    ;;
 esac
 # }}}
 # ====================================
