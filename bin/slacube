@@ -328,8 +328,14 @@ cmd_bad_channel()
     add) shift;
 			check_rc BAD_CHANNEL_FILE
 			local fpath=$(read_rc BAD_CHANNEL_FILE)
+
+      [[ $# -eq 1 || $# -eq 2 ]] \
+        || die "Usage: $PROGRAM bad-channel set CHIP-KEY [CH1,CH2,...]"
+
+      [[ -z $2|| $2 =~ ^[0-9,]+$ ]] || die "Error: invalid channel list $2"
+
 			yes_no "Overwriting ${fpath}?"
-      slacube-mask-channel.py "$fpath" "$@"
+      slacube-mask-channel.py "$fpath" $1 $2
       ;;
     help) shift; show_help bad-channel ;;
 		*) echo "Usage: $PROGRAM bad-channel [set|copy|add|help]" ;;
