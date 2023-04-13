@@ -154,8 +154,9 @@ make_workdir()
 	_EOF
 
 	cat <<-_EOF
+
 	Run:
-		 source \$(slacube env last)
+		 source \$(slacube env curr)
 	to activate the working environment.
 	_EOF
 }
