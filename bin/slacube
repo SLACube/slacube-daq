@@ -255,8 +255,11 @@ cmd_env()
 			local fpath="$(ls -t | head -n1)/setup.sh"
       [[ -f "$fpath" ]]  && echo $(realpath $fpath)  || die "Error: setup.sh not found"
 			;;
+    list) shift
+      find $PWD -maxdepth 2 -type f -name setup.sh
+      ;;
     help) shift; show_help env;;
-		*) echo "Usage: $PROGRAM env [create|last|help]" ;;
+		*) echo "Usage: $PROGRAM env [create|last|list|help]" ;;
 	esac
 }
 
