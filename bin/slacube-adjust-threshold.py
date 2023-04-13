@@ -26,7 +26,7 @@ def adjust_trim(fpath, inc, channels=range(64)):
 
     channels = set(channels)
     for ch in channels:
-        if isinstance(ch, int) and ch>=0 and ch<=31:
+        if isinstance(ch, int) and ch>=0 and ch<=63:
             continue
 
         print(f'Error invalid channel: {ch}', file=sys.stderr)
