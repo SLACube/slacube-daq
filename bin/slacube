@@ -274,7 +274,7 @@ cmd_hydra()
 
     set) shift;
 			local fpath
-			[[ $# -eq 0 ]] && fpath="$(ls *.json | fzf)" || fpath="$@"
+			[[ $# -eq 0 ]] && fpath="$(ls -t tile-*.json | fzf)" || fpath="$@"
 			[[ ! -f $fpath ]] && die "Error: file not found"
 			write_rc CTRL_FILE "$(realpath $fpath)"
       ;;
