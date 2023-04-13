@@ -145,7 +145,7 @@ make_workdir()
 		&& RC_LOCAL="${workdir}/.slacuberc" \
 		&& touch "$RC_LOCAL" \
     && cp -r ${SLACUBE_QC_SCRIPTS}/io . \
-		&& cp ${SLACUBE_QC_SCRIPTS}/bad_channels.json $workdir/bad-channel_default.json \
+		&& cp ${SLACUBE_QC_SCRIPTS}/bad_channels.json $workdir/bad_channels-default.json \
 		&& write_rc BAD_CHANNEL_FILE $workdir/bad-channel_default.json 
 
 	[[ $? -eq 0 ]] || die "Error: Fail to crate working directory!"
