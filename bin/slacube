@@ -1,0 +1,677 @@
+#!/usr/bin/env bash
+
+# ====================================
+# Global variables {{{
+# ====================================
+PROGRAM="${0##*/}"
+RC_LOCAL=${SLACUBE_WORKDIR}/.slacuberc
+unset GIT_DIR GIT_WORK_TREE GIT_NAMESPACE GIT_INDEX_FILE GIT_INDEX_VERSION \
+  GIT_OBJECT_DIRECTORY GIT_COMMON_DIR
+# }}}
+# ====================================
+# Auxilary Functions {{{
+# ====================================
+hex_now()
+{
+  printf '%x\n' $(date +%s)
+}
+
+die()
+{
+  echo "$@" >&2
+  exit 1
+}
+
+yes_no()
+{
+  [[ -t 0 ]] || return 0
+  local answer 
+  read -r -p "$1 [y/N] " answer
+  [[ $answer == [yY] ]] || exit 1
+}
+
+show_help()
+{
+  local fpath="${SLACUBE_HELP_DIR}/${1}.md"
+  [[ -f "$fpath" ]] || die "Error: No help for command \"$1\""
+  ${SLACUBE_PAGER-less} "$fpath"
+}
+# }}}
+# ====================================
+# Read/Write/Check .slacuberc {{{
+# ====================================
+read_rc()
+{
+  awk -vKEY="$1" '$1 == KEY { print $2 }'  < $RC_LOCAL
+}
+
+write_rc()
+{
+	local key=$1; shift
+	local value="$@"
+  sed -i /^$key/d $RC_LOCAL
+	echo "$key	$value" >> $RC_LOCAL && echo "Set $key=$value"
+}
+
+check_rc()
+{
+  local fpath=$(read_rc $1)
+	[[ $1 =~ "_FILE" && -f $fpath ]] && return
+	[[ $1 =~ "_DIR" && -d $fpath ]] && return
+
+  case "$1" in
+		CTRL_FILE)
+			cat >&2 <<-_EOF
+			Error: Controller file not set/found.
+
+			Try:
+			   > slacube hydra create
+			   > slacube hydra set
+			to obatin the controller file.
+			_EOF
+      exit 1
+      ;;
+    BLACKLIST_FILE)
+			cat >&2 <<-_EOF
+			Error: bad channels list not set/found.
+
+			Try:
+			   > slacube blacklist set [file]
+			_EOF
+      exit 1
+      ;;
+    PEDESTAL_FILE)
+			cat >&2 <<-_EOF
+			Error: reference pedestal file not set/found.
+
+			Try:
+			   > slacube pedestal set [file]
+			_EOF
+      exit 1
+      ;;
+    CFG_DIR)
+			cat >&2 <<-_EOF
+			Error: threshold config not set/found.
+
+			Try:
+			   > slacube threshold start [--cryo]
+			to generate a new config, OR
+				 > slacube threshold set [cfg]
+      to select a cfg directory.
+			_EOF
+      exit 1
+      ;;
+
+		*) die "Error: Invalid key ($1)" ;;
+  esac
+	exit 1
+}
+
+# }}}
+# ====================================
+# Check env variables {{{
+# ====================================
+check_workdir()
+{
+  # TODO (2023-03-27 kvt) usage
+  [[ -d "$SLACUBE_WORKDIR" ]] || die "Error: \$SLACUBE_WORKDIR not set"
+  touch "$RC_LOCAL"
+}
+check_dropbox()
+{
+	[[ $SLACUBE_DROPBOX ]] || die "Error: \$SLACUBE_DROPBOX not set"
+	[[ -d "$SLACUBE_DROPBOX" ]] || die "Error: directory not found $SLACUBE_DROPBOX"
+}
+
+check_git()
+{
+  [[ $SLACUBE_GIT_DIR ]] || die "Error: \$SLACUBE_GIT_DIR not set"
+  [[ $(git -C "$SLACUBE_GIT_DIR" \
+    rev-parse --is-inside-work-tree 2>/dev/null) == true ]]  \
+    || die "Error: \$$SLACUBE_GIT_DIR is not a git repository"
+}
+# }}}
+# ====================================
+# Task-specified functions (no check on env vars) {{{
+# ====================================
+make_workdir()
+{
+  local workdir="${SLACUBE_DEFAULT_WORKDIR-.}/${@-slacube}_$(hex_now)"
+
+  echo "Preparing working directory: $workdir"
+	echo
+  mkdir -p $workdir\
+    && cd $workdir\
+		&& RC_LOCAL="${workdir}/.slacuberc" \
+		&& touch "$RC_LOCAL" \
+    && cp -r ${SLACUBE_QC_SCRIPTS}/io . \
+		&& cp ${SLACUBE_QC_SCRIPTS}/bad_channels.json $workdir/blacklist_default.json \
+		&& write_rc BLACKLIST_FILE $workdir/blacklist_default.json 
+
+	[[ $? -eq 0 ]] || die "Error: Fail to crate working directory!"
+  cat >"$workdir/setup.sh" <<-_EOF
+		export SLACUBE_WORKDIR="$workdir"
+		alias slacube-cd="cd $workdir"
+	_EOF
+
+	cat <<-_EOF
+	Run:
+		 source \$(slacube env last)
+	to activate the working environment.
+	_EOF
+}
+
+select_chip_cfg()
+{
+  local key="$1"
+  local cfg="$(read_rc CFG_DIR)"
+  
+  local n=$(ls -1 ${cfg}/config-${key}-*.json 2> /dev/null | wc -l)
+  [[ $n -ne 1 ]] && return
+
+  ls -1 ${cfg}/config-${key}-*.json
+}
+
+adjust_global_threshold()
+{
+  local inc=$1
+  [[ -z $inc || $inc =~ ^[+-]?[0-9]+$ ]] || die "Error: non-integer adjustment"
+
+  case $# in
+    1)
+      local cfg=$(read_rc CFG_DIR)
+
+      echo "Adjust global threshold for ALL chips by $inc"
+      yes_no "Overwriting $cfg?"
+      for fpath in ${cfg}/config-*.json
+      do
+        slacube-adjust-threshold.py global "$fpath" $1
+      done
+      ;;
+    2)
+      local chip=$2
+      local fpath=$(select_chip_cfg $chip)
+      [[ -f "$fpath" ]] || die "Error: config not found for $chip"
+
+      echo "Adjust global threshold for $2 by $inc"
+      yes_no "Overwriting $fpath?"
+      slacube-adjust-threshold.py global "$fpath" $1
+      ;;
+    *) echo "$PROGRAM threshold adjust global DELTA [CHIP-ID]"
+  esac
+}
+
+adjust_trim_threshold()
+{
+  [[ $# -lt 2 ]] \
+    && die "$PROGRAM threshold adjust trim DELTA CHIP-ID [CH1,CH2,...]"
+
+  local inc=$1 ; shift
+  [[ -z $inc || $inc =~ ^[+-]?[0-9]+$ ]] || die "Error: non-integer adjustment"
+
+  local chip=$1 ; shift
+  local fpath=$(select_chip_cfg $chip)
+  [[ -f "$fpath" ]] || die "Error: config not found for $chip"
+
+  case $# in 
+    0)
+      echo "Adjust trim threshold for $chip by $inc (channels: ALL)"
+      yes_no "Overwriting $fpath?"
+      slacube-adjust-threshold.py trim "$fpath" $inc
+      ;;
+    1)
+      [[ $1 =~ ^[0-9,]+$ ]] || die "Error: invalid channel list $1"
+      echo "Adjust trim threshold for $chip by $inc (channels: $1)"
+      yes_no "Overwriting $fpath?"
+      slacube-adjust-threshold.py trim "$fpath" $inc --channels $1
+      ;;
+    *)
+      die "Error: no space allowed in channel list"
+  esac
+}
+# }}}
+# ====================================
+# Commands {{{
+# ====================================
+cmd_env()
+{
+	case "$1" in
+		create) shift;
+			make_workdir "$@"
+			;;
+		last) shift;
+			local n=$(find ${SLACUBE_DEFAULT_WORKDIR} -maxdepth 1 -type d | wc -l)
+			if [[ $n -eq 1 ]]
+			then
+				cat >&2 <<-_EOF
+				Error: \$SLACUBE_WORKDIR not created.
+				
+				Try:
+				   $PROGRAM env create
+				_EOF
+				exit 1
+			fi
+
+			#TODO (2023-03-27 kvt) option to select workdir
+			local fpath="$(ls -dt ${SLACUBE_DEFAULT_WORKDIR}/* | head -n1)/setup.sh"
+			[[ -f "$fpath" ]]  && echo $fpath  || die "Error: setup.sh not found"
+			;;
+    help) shift; show_help env;;
+		*) echo "Usage: $PROGRAM env [create|last|help]" ;;
+	esac
+}
+
+cmd_hydra()
+{
+  cd "${SLACUBE_WORKDIR}"
+  case "$1" in
+    create) shift;
+      python "${SLACUBE_QC_SCRIPTS}/map_uart_links_test.py"
+      ;;
+
+    set) shift;
+			local fpath
+			[[ $# -eq 0 ]] && fpath="$(ls *.json | fzf)" || fpath="$@"
+			[[ ! -f $fpath ]] && die "Error: file not found"
+			write_rc CTRL_FILE "$(realpath $fpath)"
+      ;;
+    plot) shift;
+      local fpath
+      [[ $# -eq 0 ]] && fpath=$(read_rc CTRL_FILE) || fpath="$@"
+			[[ ! -f $fpath ]] && die "Error: file not found"
+      local outfile="hydra_$(hex_now).png"
+      plot_hydra.py "$fpath" "$outfile"
+      echo "Save figure to $outfile"
+      ;;
+    help) shift; show_help hydra ;;
+    *) echo "Usage: $PROGRAM hydra [create|set|plot|help]" ;;
+  esac
+}
+
+cmd_rate_test()
+{
+	cd "$SLACUBE_WORKDIR"
+  case "$1" in
+    start) shift;
+			check_rc CTRL_FILE
+			check_rc BLACKLIST_FILE
+      python "${SLACUBE_QC_SCRIPTS}/trigger_rate_qc.py" \
+				--controller_config $(read_rc CTRL_FILE) \
+				--disabled_list $(read_rc BLACKLIST_FILE) \
+				"$@"
+      ;;
+    help) shift; show_help rate-test;;
+    *) echo "Usage: $PROGRAM rate-test [start|help]" ;;
+  esac
+}
+
+cmd_blacklist()
+{
+  cd $SLACUBE_WORKDIR
+	case "$1" in
+		set) shift;
+			local fpath
+			[[ $# -eq 0 ]] && fpath="$(ls -t *.json | fzf)" || fpath="$@"
+			[[ ! -f $fpath ]] && die "Error: file not found"
+			write_rc BLACKLIST_FILE $(realpath "$fpath")
+			;;
+    copy) shift;
+			check_rc BLACKLIST_FILE
+      local fpath="bad_channels-$(hex_now).json"
+      cp -r "$(read_rc BLACKLIST_FILE)" "$fpath" \
+        && write_rc BLACKLIST_FILE $(realpath "$fpath") \
+        || die "Error: fail to copy blacklist"
+      ;;
+    add) shift;
+			check_rc BLACKLIST_FILE
+			local fpath=$(read_rc BLACKLIST_FILE)
+			yes_no "Overwriting ${fpath}?"
+      slacube-mask-channel.py "$fpath" "$@"
+      ;;
+    help) shift; show_help blacklist ;;
+		*) echo "Usage: $PROGRAM blacklist [set|copy|add|help]" ;;
+	esac
+}
+
+cmd_pedestal()
+{
+	cd "$SLACUBE_WORKDIR"
+	case "$1" in
+		start) shift;
+			check_rc CTRL_FILE
+			check_rc BLACKLIST_FILE
+      python "${SLACUBE_QC_SCRIPTS}/pedestal_qc.py" \
+				--controller_config $(read_rc CTRL_FILE) \
+				--disabled_list $(read_rc BLACKLIST_FILE) \
+        --no_refinement --no_log_simple \
+				"$@"
+			;;
+		start-qc) shift;
+			check_rc CTRL_FILE
+			check_rc BLACKLIST_FILE
+      python "${SLACUBE_QC_SCRIPTS}/pedestal_qc.py" \
+				--controller_config $(read_rc CTRL_FILE) \
+				--disabled_list $(read_rc BLACKLIST_FILE) \
+				"$@"
+			;;
+		plot) shift;
+			local fpath
+			[[ $# -eq 0 ]] && fpath="$(ls -t *pedestal_*.h5 | fzf)" || fpath="$@"
+			[[ ! -f $fpath ]] && die "Error: file not found"
+			analyze_ped.py "$fpath" --save "png,csv" -p
+			;;
+		set) shift;
+			local fpath
+			[[ $# -eq 0 ]] && fpath="$(ls -t *pedestal_*.h5 | fzf)" || fpath="$@"
+			[[ ! -f $fpath ]] && die "Error: file not found"
+			write_rc PEDESTAL_FILE $(realpath "$fpath")
+			;;
+    help) shift; show_help pedestal ;;
+		*) echo "Usage: $PROGRAM pedestal [start|start-qc|set|plot|help]" ;;
+	esac
+}
+
+cmd_threshold()
+{
+	cd "$SLACUBE_WORKDIR"
+  case "$1" in
+    adjust) shift;
+      check_rc CFG_DIR
+
+      local mode=$1; shift
+      case $mode in 
+        global)
+          adjust_global_threshold $@
+          ;;
+        trim)
+          adjust_trim_threshold $@
+          ;;
+        *) echo "$PROGRAM threshold adjust [global|trim]"
+      esac
+      ;;
+    start) shift;
+			check_rc CTRL_FILE
+			check_rc BLACKLIST_FILE
+      check_rc PEDESTAL_FILE
+
+      local cfg_dir
+      echo "Checking --cryo flag ..."
+      if [[ "$@" =~ "--cryo" ]] 
+      then
+        yes_no "Cold operation in cryo?" 
+        cfg_dir="cfg_cold_$(hex_now)" 
+      else
+        yes_no "Warm operation at room temperature?" 
+        cfg_dir="cfg_room_$(hex_now)" 
+      fi
+      mkdir "$cfg_dir"
+
+      python "${SLACUBE_QC_SCRIPTS}/threshold_qc.py" \
+				--controller_config $(read_rc CTRL_FILE) \
+				--disabled_list $(read_rc BLACKLIST_FILE) \
+        --pedestal_file $(read_rc PEDESTAL_FILE) \
+        --outdir "$cfg_dir" \
+				"$@" \
+        && write_rc CFG_DIR "$(realpath $cfg_dir)" \
+        && (echo; echo "Set CFG_DIR=$cfg_dir")
+			;;
+    plot) shift;
+			local cfg 
+      [[ $# -eq 0 ]] && cfg=$(read_rc CFG_DIR) || cfg="$@"
+      [[ -d $cfg ]] || die "Error: cfg not found"
+
+      local vdda
+      read -r -p "VDDA: [default 1800] " vdda
+      vdda=${vdda:-1800}
+      echo "Plotting threshold with VDDA=$vdda ..."
+      plot_threshold.py $cfg $vdda -p
+      ;;
+    copy) shift;
+			check_rc CTRL_FILE
+      old_cfg=$(read_rc CFG_DIR)
+      new_cfg=$(basename $old_cfg)
+      new_cfg="$(echo $new_cfg | sed 's/\(.*\)_.*/\1/')_$(hex_now)"
+      cp -r "$old_cfg" "$new_cfg" \
+        && write_rc CFG_DIR "$(realpath $new_cfg)" \
+        || die "Error: fail to copy threshold cfg"
+      ;;
+		set) shift;
+			local cfg 
+			[[ $# -eq 0 ]] && cfg="$(ls -dt cfg* | fzf)" || cfg="$@"
+			[[ -d $cfg ]] || die "Error: cfg not found"
+			write_rc CFG_DIR $(realpath "$cfg")
+			;;
+    *) echo "Usage: $PROGRAM threshold [start|set|copy|adjust|plot|help]"
+  esac
+}
+
+cmd_selftrig()
+{
+  cd "$SLACUBE_WORKDIR"
+  case "$1" in
+    start) shift;
+			check_rc CTRL_FILE
+			check_rc BLACKLIST_FILE
+      check_rc CFG_DIR
+
+      python "${SLACUBE_QC_SCRIPTS}/selftrigger_qc.py" \
+				--controller_config $(read_rc CTRL_FILE) \
+				--disabled_list $(read_rc BLACKLIST_FILE) \
+        --config_name $(read_rc CFG_DIR)  \
+        "$@"
+      ;;
+		convert) shift;
+			local fpath
+			[[ $# -eq 0 ]] && fpath="$(ls -t raw_*.h5 | fzf)" || fpath="$@"
+			[[ ! -f $fpath ]] && die "Error: file not found"
+
+      local outfile=$(basename $fpath)
+			outfile=${outfile/raw_/selftrigger_}
+			echo "Input: $fpath"
+      convert_raw.py --input_filename "$fpath" --output_filename "$outfile"
+			echo "Output: $outfile"
+			;;
+    plot) shift
+			local fpath
+			[[ $# -eq 0 ]] && fpath="$(ls -t selftrigger_*.h5 | fzf)" || fpath="$@"
+			[[ ! -f $fpath ]] && die "Error: file not found"
+
+      plot_selftrigger.py "$fpath" -p --save "png,csv"
+      ;;
+    help) shift; show_help selftrig ;;
+    *) echo "Usage: $PROGRAM selftrig [start|convert|plot|help]"
+  esac
+}
+
+cmd_pedmon()
+{
+  cd "$SLACUBE_WORKDIR"
+  case "$1" in
+    start) shift;
+      check_rc CTRL_FILE
+      check_rc BLACKLIST_FILE
+
+			[[ $# -ne 0 && $# -ne 2 ]] && die "Usage: $PROGRAM ped-mon [runtime] [trig_cycle]"
+			local runtime=${1-600}
+			local cycles=${2-2000000}
+
+			check_dropbox
+			
+      mkdir -p tmp || die "Error: Fail to create tmp directory"
+      echo 1 > .state
+
+      while [[ $(cat .state) -ne 0 ]]
+      do
+        local tmp=$(mktemp -p tmp -d)
+
+        python "${SLACUBE_QC_SCRIPTS}/pedestal_qc.py" \
+          --controller_config $(read_rc CTRL_FILE) \
+          --disabled_list $(read_rc BLACKLIST_FILE) \
+          --runtime $runtime \
+          --periodic_trigger_cycles $cycles\
+          --outdir $tmp \
+          --no_refinement --no_log_simple
+        mv ${tmp}/*.h5 "${SLACUBE_DROPBOX}" && rmdir "$tmp"
+      done
+      ;;
+    stop) shift;
+      echo 0 > .state
+			;;
+    analyze) shift;
+      mkdir -p ped_mon
+
+			[[ $# -eq 0 ]] \
+				&& fpath="$(ls -t ${SLACUBE_DROPBOX}/pedestal*.h5  | fzf)" \
+				|| fpath="$@"
+
+			[[ -f "$fpath" ]] || die "Error: file not found!"
+
+      analyze_ped_mon.py "$fpath" 60 -p -o ped_mon
+      ;;
+    plot) shift;
+			local indir="${@-ped_mon}"
+      [[ -d "$indir" ]]  || die "Error: directory not found!"
+
+      plot_ped_mon.py ped_mon -p "$@"
+      ;;
+    help) shift; show_help selftrig ;;
+    *) echo "Usage: $PROGRAM ped-mon [start|stop|analyze|plot|help]"
+  esac
+}
+
+cmd_run()
+{
+  cd "$SLACUBE_WORKDIR"
+
+  case "$1" in
+    start) shift;
+			check_rc CTRL_FILE
+			check_rc BLACKLIST_FILE
+      check_rc CFG_DIR
+			check_dropbox
+
+			[[ $# -ne 0 && $# -ne 3 ]] \
+				&& die "Usage: $PROGRAM run start [ped-runtime] [seltrig-runtime] [seltrig-repeat]"
+
+      local ped_runtime=${1-120}
+      local selftrig_runtime=${2-1200}
+      local selftrig_repeat=${3-3}
+
+			export -f convert_and_move
+
+      mkdir -p tmp || die "Error: Fail to create tmp directory"
+      echo 1 > .state
+
+      while [[ $(cat .state) -ne 0 ]]
+      do
+        local tmp=$(mktemp -p tmp -d)
+
+        python "${SLACUBE_QC_SCRIPTS}/pedestal_qc.py" \
+				  --controller_config $(read_rc CTRL_FILE) \
+				  --disabled_list $(read_rc BLACKLIST_FILE) \
+          --runtime $ped_runtime \
+          --outdir $tmp \
+          --no_refinement --no_log_simple \
+          && mv $tmp/*.h5 "$SLACUBE_DROPBOX" \
+          && rmdir $tmp
+
+        local -i n=0
+        while [[ $n -lt $selftrig_repeat && $(cat .state) -ne 0 ]]
+        do
+          local tmp=$(mktemp -p tmp -d)
+
+          python "${SLACUBE_QC_SCRIPTS}/selftrigger_qc.py" \
+            --controller_config $(read_rc CTRL_FILE) \
+            --disabled_list $(read_rc BLACKLIST_FILE) \
+            --config_name $(read_rc CFG_DIR)  \
+            --outdir $tmp --runtime $selftrig_runtime
+
+					nq slacube-convert-and-move $tmp
+          n=$((n+1)) 
+        done
+      done
+      ;;
+    stop) shift;
+      echo 0 > .state
+			;;
+    help) shift; show_help run;;
+    *) echo "Usage: $PROGRAM run [start|stop|help]"
+  esac
+}
+
+cmd_cfg()
+{
+  case "$1" in
+    archive) shift;
+      check_rc CTRL_FILE
+      check_rc BLACKLIST_FILE
+      check_rc CFG_DIR
+      check_git
+
+      local cfg=$(read_rc CFG_DIR)
+      local mdate=$(date -r "$cfg" +%Y-%m-%d)
+      local myear=${mdate%%-*}
+      
+      local name
+      [[ $# -eq 0 ]] && name=$(basename "$cfg") || name="$@"
+
+      local outdir="${SLACUBE_GIT_DIR}/configs/${myear}/${mdate}__${name}"
+      if [[ -d $outdir ]]
+			then
+				cat >&2 <<-_EOF
+				Error: duplicate config $(basename $outdir)
+
+				Try a different config name
+				   > $PROGRAM cfg archive CONFIG_NAME
+				_EOF
+      	exit 1
+			fi
+
+			local author
+			read -r -p "Your name: " author
+
+			local comment
+			read -r -p "Comment (one line): " comment
+
+			echo 
+			echo "Archiving config to $(basename $outdir) ..."
+			echo "${author}: ${comment}"
+			yes_no "Commit?"
+
+			mkdir -p $outdir || die "Error: fail to create archive directory"
+			cp -r "$cfg" "$(read_rc CTRL_FILE)" "$(read_rc BLACKLIST_FILE)" "$outdir" \
+				|| die "Error: fail to copy files"
+			git -C "$SLACUBE_GIT_DIR"  add "$outdir" \
+				&& git -C "$SLACUBE_GIT_DIR" commit -m "${author}: ${comment}" \
+				&& echo "DONE"
+			;;
+    help) shift; show_help cfg;;
+    *)
+      printenv | grep --color=never SLACUBE_ 
+      echo
+      cat $RC_LOCAL
+  esac
+}
+# }}}
+# ====================================
+# main() {{{
+# ====================================
+# check workdir except running with no argument or "env,help"
+[[ $# -eq 0 || "$1" == "env" || "$1" == "help" ]] || check_workdir
+
+case "$1" in
+	env)        shift; cmd_env "$@"       ;;
+  hydra)      shift; cmd_hydra "$@"     ;;
+  rate-test)  shift; cmd_rate_test "$@" ;;
+  blacklist)  shift; cmd_blacklist "$@" ;;
+  pedestal)   shift; cmd_pedestal "$@"  ;;
+  threshold)  shift; cmd_threshold "$@" ;;
+  selftrig)   shift; cmd_selftrig "$@"  ;;
+  ped-mon)    shift; cmd_pedmon "$@"    ;;
+  run)        shift; cmd_run "$@"       ;;
+  cfg)        shift; cmd_cfg "$@"       ;;
+  help)       shift; show_help slacube  ;;
+  *)          echo "Usage: $PROGRAM"    ;;
+esac
+# }}}
+# ====================================
