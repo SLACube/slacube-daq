@@ -421,8 +421,7 @@ cmd_threshold()
         --pedestal_file $(read_rc PEDESTAL_FILE) \
         --outdir "$cfg_dir" \
 				"$@" \
-        && write_rc CFG_DIR "$(realpath $cfg_dir)" \
-        && (echo; echo "Set CFG_DIR=$cfg_dir")
+        && echo && write_rc CFG_DIR "$(realpath $cfg_dir)" 
 			;;
     plot) shift;
 			local cfg 
