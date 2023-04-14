@@ -36,9 +36,14 @@ Create a new working environment with custom prefix
    $ slacube env create mytest
 ```
 
-Setup the most recent working environment 
+Activate the most recent working environment 
 ```
-   $ source $(slacube env last)
+   $ source $(slacube env curr)
+```
+
+List all availibe environments
+```
+   slacube env list
 ```
 
 Setup a previous working environment
