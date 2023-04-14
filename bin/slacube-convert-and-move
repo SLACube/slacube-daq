@@ -9,7 +9,8 @@ indir="$@"
 for fpath in ${indir}/raw*.h5
 do 
   out_path=${fpath/raw_/selftrigger_}
-  convert_raw.py --input_filename "$fpath"  --output_filename "$out_path"  \
+  slacube-convert-raw.py \
+    --input_filename "$fpath"  --output_filename "$out_path" \
     && mv "$fpath" "$out_path" "$SLACUBE_DROPBOX" 
 done 
 
