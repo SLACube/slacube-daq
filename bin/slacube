@@ -429,7 +429,7 @@ cmd_threshold()
       [[ -d $cfg ]] || die "Error: cfg not found"
 
       local vdda
-      read -r -p "VDDA: [default 1800] " vdda
+      read -r -p "VDDA (mV): [default 1800] " vdda
       vdda=${vdda:-1800}
       echo "Plotting threshold with VDDA=$vdda ..."
       plot_threshold.py $cfg $vdda -p
@@ -660,6 +660,24 @@ cmd_cfg()
       cat $RC_LOCAL
   esac
 }
+
+cmd_power()
+{
+	[[ $SLACUBE_PACMAN_ADDR ]] || die "Error: \$SLACUBE_PACMAN_ADDR not set"
+
+  case "$1" in
+    status) shift;
+      ssh root@${SLACUBE_PACMAN_ADDR} ./report_power0.sh
+      ;;
+    down) shift;
+      yes_no "Power down LArPix tile?"
+      yes_no "Are you sure?"
+      ssh root@${SLACUBE_PACMAN_ADDR} ./power_down.sh
+      ;;
+    help) shift; show_help power;;
+    *) echo "Usage: $PROGRAM power [status|down|help]"
+  esac
+}
 # }}}
 # ====================================
 # main() {{{
@@ -668,18 +686,19 @@ cmd_cfg()
 [[ $# -eq 0 || "$1" == "env" || "$1" == "help" ]] || check_workdir
 
 case "$1" in
-  env)         shift; cmd_env "$@"       ;;
-  hydra)       shift; cmd_hydra "$@"     ;;
-  rate-test)   shift; cmd_rate_test "$@" ;;
-  bad-channel) shift; cmd_bad_channel "$@" ;;
-  pedestal)    shift; cmd_pedestal "$@"  ;;
-  threshold)   shift; cmd_threshold "$@" ;;
-  selftrig)    shift; cmd_selftrig "$@"  ;;
-  ped-mon)     shift; cmd_pedmon "$@"    ;;
-  run)         shift; cmd_run "$@"       ;;
-  cfg)         shift; cmd_cfg "$@"       ;;
-  help)        shift; show_help slacube  ;;
-  *)           echo "Usage: $PROGRAM"    ;;
+  env)         shift; cmd_env "$@"        ;;
+  hydra)       shift; cmd_hydra "$@"      ;;
+  rate-test)   shift; cmd_rate_test "$@"  ;;
+  bad-channel) shift; cmd_bad_channel "$@";;
+  pedestal)    shift; cmd_pedestal "$@"   ;;
+  threshold)   shift; cmd_threshold "$@"  ;;
+  selftrig)    shift; cmd_selftrig "$@"   ;;
+  ped-mon)     shift; cmd_pedmon "$@"     ;;
+  run)         shift; cmd_run "$@"        ;;
+  cfg)         shift; cmd_cfg "$@"        ;;
+  power)       shift; cmd_power "$@"      ;;
+  help)        shift; show_help slacube   ;;
+  *)           echo "Usage: $PROGRAM"     ;;
 esac
 # }}}
 # ====================================
