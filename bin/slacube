@@ -431,8 +431,15 @@ cmd_threshold()
       local vdda
       read -r -p "VDDA (mV): [default 1800] " vdda
       vdda=${vdda:-1800}
-      echo "Plotting threshold with VDDA=$vdda ..."
-      plot_threshold.py $cfg $vdda -p
+
+      local is_cryo
+      read -r -p "is_cryo [y/N]? " is_cryo
+
+      local opts
+      [[ $is_cryo == [yY] ]] && opts='--cryo'
+
+      echo "Plotting threshold with VDDA=$vdda, $opts ..."
+      plot_threshold.py $cfg $vdda -p $opts
       ;;
     copy) shift;
 			check_rc CTRL_FILE
