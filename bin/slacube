@@ -483,7 +483,8 @@ cmd_selftrig()
       local outfile=$(basename $fpath)
 			outfile=${outfile/raw_/selftrigger_}
 			echo "Input: $fpath"
-      convert_raw.py --input_filename "$fpath" --output_filename "$outfile"
+      slacube-convert-raw.py \
+        --input_filename "$fpath" --output_filename "$outfile"
 			echo "Output: $outfile"
 			;;
     plot) shift
@@ -571,8 +572,6 @@ cmd_run()
       local ped_runtime=${1-120}
       local selftrig_runtime=${2-1200}
       local selftrig_repeat=${3-3}
-
-			export -f convert_and_move
 
       mkdir -p tmp || die "Error: Fail to create tmp directory"
       echo 1 > .state
