@@ -9,6 +9,28 @@ unset GIT_DIR GIT_WORK_TREE GIT_NAMESPACE GIT_INDEX_FILE GIT_INDEX_VERSION \
   GIT_OBJECT_DIRECTORY GIT_COMMON_DIR
 # }}}
 # ====================================
+# Show version {{{
+# ====================================
+show_version()
+{
+	cat <<-_EOF
+	======================================================
+	=    slacube: collection of scripts for SLACube      =
+	=                                                    =
+	=                    v.1.0.0                         =
+	=                                                    =
+	=                  Patrick Tsang                     =
+	=             kvtsang@slac.stanford.edu              =
+	=                                                    =
+	=   https://github.com/SLACube/slacube-daq           =
+	=   https://github.com/SLACube/slacube-daq-tutorial  =
+	=                                                    =
+	=    Type "slacube help" for usuage                  =
+	======================================================
+	_EOF
+}
+# }}}
+# ====================================
 # Auxilary Functions {{{
 # ====================================
 hex_now()
@@ -704,7 +726,7 @@ case "$1" in
   cfg)         shift; cmd_cfg "$@"        ;;
   power)       shift; cmd_power "$@"      ;;
   help)        shift; show_help slacube   ;;
-  *)           echo "Usage: $PROGRAM"     ;;
+  *)           show_version               ;;
 esac
 # }}}
 # ====================================
