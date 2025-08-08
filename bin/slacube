@@ -710,8 +710,8 @@ cmd_power()
 # ====================================
 # main() {{{
 # ====================================
-# check workdir except running with no argument or "env,help"
-[[ $# -eq 0 || "$1" == "env" || "$1" == "help" ]] || check_workdir
+# check workdir except running with no argument or "env,help,power"
+[[ $# -eq 0 || "$1" == "env" || "$1" == "help" || "$1" == "power" ]] || check_workdir
 
 case "$1" in
   env)         shift; cmd_env "$@"        ;;
