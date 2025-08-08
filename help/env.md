@@ -4,7 +4,7 @@ NAME
 
 SYNOPSIS
 ========
-**slacube env [ create | curr | list| help ]**
+**slacube env [ create | curr | list | help ]**
 
 DESCRIPTION
 ===========
