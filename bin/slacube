@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 
+# ----------------------------------------------------------------------------
+# CHANGELOG
+# ----------------------------------------------------------------------------
+#
+# WHEN        WHO        WHAT
+# ----        ---        ----
+# 2025-08-11  kvt        v1.1.0 external trigger command
+#
+# ----------------------------------------------------------------------------
+
 # ====================================
 # Global variables {{{
 # ====================================
@@ -17,7 +27,7 @@ show_version()
 	======================================================
 	=    slacube: collection of scripts for SLACube      =
 	=                                                    =
-	=                    v.1.0.0                         =
+	=                    v.1.1.0                         =
 	=                                                    =
 	=                  Patrick Tsang                     =
 	=             kvtsang@slac.stanford.edu              =
@@ -521,6 +531,24 @@ cmd_selftrig()
   esac
 }
 
+cmd_exttrig()
+{
+  cd "$SLACUBE_WORKDIR"
+  case "$1" in 
+    start) shift;
+      check_rc CTRL_FILE
+      check_rc BAD_CHANNEL_FILE
+
+      python "${SLACUBE_QC_SCRIPTS}/exttrig.py" \
+        --controller_config $(read_rc CTRL_FILE) \
+        --disabled_list $(read_rc BAD_CHANNEL_FILE) \
+        "$@"
+      ;;
+    help) shift; show_help exttrig ;;
+    *) echo "Usage: $PROGRAM exttrig [start|help]"
+  esac
+}
+
 cmd_pedmon()
 {
   cd "$SLACUBE_WORKDIR"
@@ -721,6 +749,7 @@ case "$1" in
   pedestal)    shift; cmd_pedestal "$@"   ;;
   threshold)   shift; cmd_threshold "$@"  ;;
   selftrig)    shift; cmd_selftrig "$@"   ;;
+  exttrig)     shift; cmd_exttrig "$@"    ;;
   ped-mon)     shift; cmd_pedmon "$@"     ;;
   run)         shift; cmd_run "$@"        ;;
   cfg)         shift; cmd_cfg "$@"        ;;
