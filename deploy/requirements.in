@@ -1,0 +1,24 @@
+# Human-editable input for deploy/requirements-py38.txt.
+#
+# Grounded in production's `pip freeze` (76 packages) on nu-daq01-ir2,
+# `/home/slacube/app/venv/slacube-daq`, confirmed required by import-grep
+# across `analysis/` and `scripts/larpix_qc/` (see D12 in
+# docs/specs/2026/08/2026-08-08-1009-shared-release-store-daq-deploy-spec.md
+# in the slacube workspace). Deliberately excludes: Sphinx, asciinema,
+# networkx, pyserial, pytest, ipython (accumulated cruft) and scikit-learn
+# (absent from production, would drag scipy onto Python 3.8; see
+# tracker issue-001).
+#
+# Regenerate the lock after editing this file:
+#   uv pip compile deploy/requirements.in \
+#     --python-version 3.8 \
+#     --output-file deploy/requirements-py38.txt
+larpix-control==3.7.0
+numpy==1.24.2
+pandas==1.5.3
+matplotlib==3.7.1
+h5py==3.8.0
+seaborn==0.12.2
+fire==0.5.0
+PyYAML==6.0
+tqdm==4.65.0
