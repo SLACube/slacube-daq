@@ -144,13 +144,18 @@ heavier one when the lighter one covers it.
 
 **Committed work-in-progress, not ready to push to GitHub yet.** No new
 mechanism needed: `REMOTE_*` is a plain git remote and `<store>/.cache/`
-already holds a bare mirror per repo. Push a branch straight into it and
-deploy against that ref:
+already holds a bare mirror per repo (`daq.git`, `analysis.git`,
+`scripts.git`, `etc.git` -- named after the repo, not the GitHub project).
+Push a branch straight into it and deploy against that ref:
 
 ```sh
-git push nu-daq01-ir2:/opt/slacube/.cache/slacube-daq.git HEAD:wip
+git push nu-daq01-ir2:/opt/slacube/.cache/daq.git HEAD:wip
 ssh nu-daq01-ir2 'deploy/deploy.sh --config deploy/targets/slacube-dev.conf --ref daq=wip'
 ```
+
+`targets/slacube-dev.conf` pins `REF_DAQ=main`, so a bare `--config`
+invocation deploys `main`, not your pushed branch -- `--ref daq=wip` above
+is required, not optional, until the branch is merged.
 
 `resolve_refs` tries `origin` first and falls back to a ref that only
 exists in the local mirror, so this works with no config change. The
