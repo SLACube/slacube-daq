@@ -15,6 +15,25 @@ in the `slacube` workspace (D1-D15).
 - Not a state manager. `deploy.sh` never writes `workdir/`, `queue/`, the
   shared config archive, or any dropbox (D5).
 
+## Host-provided runtime prerequisites
+
+`preflight` requires these on the deploy host's `PATH`; none of them is
+vendored into `<store>/ext/` (which carries only the interactive-UI
+binaries `fzf`/`mdcat`, copied in at deploy time — see "One-time setup"):
+
+- `git` — resolving refs and archiving each repo.
+- `nq` — the queue tool `slacube run start` shells out to
+  (`bin/slacube:653`) for background raw-file conversion. Decision
+  (`task-002`, 2026-08-08): stays a host prerequisite rather than a
+  vendored binary — `ext/` is scoped to binaries the interactive shell
+  needs at the terminal, not background job-queue plumbing. Confirmed
+  present via `preflight`'s `command -v` check; there is no install step
+  here because every current target host already provides it.
+- the target Python interpreter (`--python`, checked for `-x`, not
+  installed by this tool).
+- `uv` — build-only, used to create the release venv (D6); not needed at
+  runtime once a release is sealed.
+
 ## Release / site / state model
 
 - **Release** (`<store>/releases/<UTC>-<daq-sha7>/`): immutable, generated,
