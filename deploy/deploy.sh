@@ -170,7 +170,7 @@ resolve_refs() {
     if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
       sha="$ref"
     else
-      sha="$(git ls-remote "$remote" "$ref" 2>/dev/null | awk '{print $1}' | head -1)"
+      sha="$(git ls-remote "$remote" "$ref" 2>/dev/null | awk '{print $1}' | head -1 || true)"
       [[ -n "$sha" ]] || die "could not resolve ref '$ref' for repo '$repo' against $remote"
     fi
     RESOLVED_SHA["$repo"]="$sha"
@@ -286,7 +286,7 @@ prune() {
   local f target
   for f in "$HOME"/*.sh /home/slacube/*.sh; do
     [[ -f "$f" ]] || continue
-    target="$(grep -oE 'SLACUBE_RELEASE=[^ ]+' "$f" 2>/dev/null | head -1 | cut -d= -f2)"
+    target="$(grep -oE 'SLACUBE_RELEASE=[^ ]+' "$f" 2>/dev/null | head -1 | cut -d= -f2 || true)"
     [[ -n "$target" ]] || continue
     target="$(readlink -f "$target" 2>/dev/null || echo "$target")"
     protected["$target"]=1
