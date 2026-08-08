@@ -599,7 +599,7 @@ cmd_pedmon()
 			local indir="${@-ped_mon}"
       [[ -d "$indir" ]]  || die "Error: directory not found!"
 
-      plot_ped_mon.py ped_mon -p "$@"
+      plot_ped_mon.py "$indir" -p
       ;;
     help) shift; show_help ped-mon ;;
     *) echo "Usage: $PROGRAM ped-mon [start|stop|analyze|plot|help]"
