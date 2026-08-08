@@ -11,6 +11,7 @@
 # Usage:
 #   deploy.sh --config deploy/targets/slacube-dev.conf [overrides...]
 #   deploy.sh --from-manifest <release>/manifest.json [overrides...]
+#   deploy.sh --config <conf> --dev --name NAME [--worktree REPO=PATH ...]
 #
 # Overrides (all optional; each replaces the matching --config value):
 #   --store DIR                 release store root
@@ -20,11 +21,19 @@
 #   --dropbox PATH              dropbox this release's banner will report
 #   --pacman-addr HOST          recorded in manifest + banner only (D10)
 #   --keep N                    releases to retain (D14)
+#   --dev                       build under <store>/dev/<user>/<name> instead
+#                               of <store>/releases; unsealed, never promotable
+#   --name NAME                 dev release name (required with --dev)
+#   --worktree REPO=PATH        dev only: symlink REPO to a local worktree
+#                               instead of exporting a resolved ref; manifest
+#                               is marked "dirty" and records `git describe`
 
 set -euo pipefail
 
 SELF="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPOS=(daq analysis scripts etc)
+DEV_MODE=0
+DEV_NAME=""
 
 log()  { printf '[deploy] %s\n' "$*" >&2; }
 die()  { printf '[deploy] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -35,7 +44,7 @@ die()  { printf '[deploy] ERROR: %s\n' "$*" >&2; exit 1; }
 CONFIG=""
 FROM_MANIFEST=""
 declare -A REF_OVERRIDE=()
-
+declare -A WORKTREE_OVERRIDE=()
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -47,6 +56,8 @@ parse_args() {
       --dropbox)        OVR_DROPBOX="$2"; shift 2 ;;
       --pacman-addr)    OVR_PACMAN_ADDR="$2"; shift 2 ;;
       --keep)           OVR_KEEP="$2"; shift 2 ;;
+      --dev)            DEV_MODE=1; shift ;;
+      --name)           DEV_NAME="$2"; shift 2 ;;
       --ref)
         local kv="$2" repo val
         repo="${kv%%=*}"; val="${kv#*=}"
@@ -58,6 +69,18 @@ parse_args() {
         REF_OVERRIDE["$repo"]="$val"
         shift 2
         ;;
+      --worktree)
+        local kv="$2" repo val
+        repo="${kv%%=*}"; val="${kv#*=}"
+        [[ "$repo" != "$kv" ]] || die "--worktree must be REPO=PATH, got '$kv'"
+        case " ${REPOS[*]} " in
+          *" $repo "*) ;;
+          *) die "unknown --worktree repo '$repo'; expected one of: ${REPOS[*]}" ;;
+        esac
+        [[ -d "$val" ]] || die "--worktree path not a directory: $val"
+        WORKTREE_OVERRIDE["$repo"]="$(cd -P "$val" && pwd)"
+        shift 2
+        ;;
       *) die "unknown argument '$1'" ;;
     esac
   done
@@ -65,11 +88,19 @@ parse_args() {
   [[ -n "$CONFIG" || -n "$FROM_MANIFEST" ]] \
     || die "--config or --from-manifest is required"
 
+  if [[ ${#WORKTREE_OVERRIDE[@]} -gt 0 && "$DEV_MODE" -ne 1 ]]; then
+    die "--worktree requires --dev"
+  fi
+  if [[ "$DEV_MODE" -eq 1 && -z "$DEV_NAME" ]]; then
+    die "--dev requires --name NAME"
+  fi
+
   if [[ -n "$CONFIG" ]]; then
     [[ -f "$CONFIG" ]] || die "config file not found: $CONFIG"
     # shellcheck source=/dev/null
     source "$CONFIG"
   fi
+
 
   if [[ -n "$FROM_MANIFEST" ]]; then
     [[ -f "$FROM_MANIFEST" ]] || die "manifest not found: $FROM_MANIFEST"
@@ -107,6 +138,7 @@ print(m['refs']['$repo']['sha'])
   [[ -n "${PACMAN_ADDR:-}" ]] || missing+=(PACMAN_ADDR)
   [[ -n "${KEEP:-}" ]]        || missing+=(KEEP)
   for repo in "${REPOS[@]}"; do
+    [[ -n "${WORKTREE_OVERRIDE[$repo]:-}" ]] && continue
     local var="REF_${repo^^}" rvar="REMOTE_${repo^^}"
     [[ -n "${!var:-}" ]]  || missing+=("$var")
     [[ -n "${!rvar:-}" ]] || missing+=("$rvar")
@@ -162,16 +194,35 @@ preflight() {
 declare -A RESOLVED_SHA=()
 
 resolve_refs() {
-  local repo ref remote sha
+  mkdir -p "${STORE}/.cache"
+  local repo ref remote sha cache
   for repo in "${REPOS[@]}"; do
+    if [[ -n "${WORKTREE_OVERRIDE[$repo]:-}" ]]; then
+      RESOLVED_SHA["$repo"]="worktree"
+      continue
+    fi
     local rvar="REMOTE_${repo^^}" fvar="REF_${repo^^}"
     remote="${!rvar}"
     ref="${!fvar}"
+    cache="${STORE}/.cache/${repo}.git"
+    if [[ ! -d "$cache" ]]; then
+      log "seeding local mirror for $repo"
+      git init -q --bare "$cache"
+      git -C "$cache" remote add origin "$remote"
+    fi
+    # Best-effort: updates the mirror from origin. Allowed to fail so a
+    # branch that exists only in this local mirror (e.g. pushed straight
+    # into the cache for WIP -- Loop A) still resolves below.
+    git -C "$cache" fetch -q origin "$ref" 2>/dev/null || true
     if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
       sha="$ref"
+      git -C "$cache" cat-file -e "${sha}^{commit}" 2>/dev/null \
+        || die "sha '$sha' not found for repo '$repo' (origin fetch failed and it is not already in ${cache})"
     else
-      sha="$(git ls-remote "$remote" "$ref" 2>/dev/null | awk '{print $1}' | head -1 || true)"
-      [[ -n "$sha" ]] || die "could not resolve ref '$ref' for repo '$repo' against $remote"
+      sha="$(git -C "$cache" rev-parse -q --verify FETCH_HEAD 2>/dev/null || true)"
+      [[ -n "$sha" ]] || sha="$(git -C "$cache" rev-parse -q --verify "refs/heads/${ref}" 2>/dev/null || true)"
+      [[ -n "$sha" ]] || sha="$(git -C "$cache" rev-parse -q --verify "refs/tags/${ref}" 2>/dev/null || true)"
+      [[ -n "$sha" ]] || die "could not resolve ref '$ref' for repo '$repo' against $remote (not on origin, not already in ${cache})"
     fi
     RESOLVED_SHA["$repo"]="$sha"
     log "resolved $repo $ref -> $sha"
@@ -183,39 +234,62 @@ resolve_refs() {
 # ============================================================
 RELEASE_DIR=""
 RELEASE_ID=""
+declare -A EXT_SHA256=()
 
 build_release() {
-  local ts daq_short
-  ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  daq_short="${RESOLVED_SHA[daq]:0:7}"
-  RELEASE_ID="${ts}-${daq_short}"
-  RELEASE_DIR="${STORE}/releases/${RELEASE_ID}"
-
-  [[ -e "$RELEASE_DIR" ]] && die "release directory already exists: $RELEASE_DIR"
+  if [[ "$DEV_MODE" -eq 1 ]]; then
+    RELEASE_ID="dev-${USER}-${DEV_NAME}"
+    RELEASE_DIR="${STORE}/dev/${USER}/${DEV_NAME}"
+    if [[ -e "$RELEASE_DIR" ]]; then
+      log "dev release exists, rebuilding in place: $RELEASE_DIR"
+      find "$RELEASE_DIR" -type d -exec chmod u+w {} + 2>/dev/null || true
+      rm -rf "$RELEASE_DIR"
+    fi
+  else
+    local ts daq_short
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    daq_short="${RESOLVED_SHA[daq]:0:7}"
+    RELEASE_ID="${ts}-${daq_short}"
+    RELEASE_DIR="${STORE}/releases/${RELEASE_ID}"
+    [[ -e "$RELEASE_DIR" ]] && die "release directory already exists: $RELEASE_DIR"
+  fi
 
   mkdir -p "$RELEASE_DIR"
 
-  local repo rvar sha dest
+  local repo dest cache
   for repo in "${REPOS[@]}"; do
-    rvar="REMOTE_${repo^^}"
-    sha="${RESOLVED_SHA[$repo]}"
     dest="${RELEASE_DIR}/${repo}"
-    log "cloning $repo @ $sha"
-    git init -q "$dest"
-    git -C "$dest" remote add origin "${!rvar}"
-    git -C "$dest" fetch -q --depth 1 origin "$sha"
-    git -C "$dest" checkout -q --detach FETCH_HEAD
+    if [[ -n "${WORKTREE_OVERRIDE[$repo]:-}" ]]; then
+      log "linking $repo -> ${WORKTREE_OVERRIDE[$repo]} (dev, dirty)"
+      ln -s "${WORKTREE_OVERRIDE[$repo]}" "$dest"
+      continue
+    fi
+    cache="${STORE}/.cache/${repo}.git"
+    mkdir -p "$dest"
+    log "exporting $repo @ ${RESOLVED_SHA[$repo]} (no .git -- pinned input, see D8)"
+    if [[ "$repo" == "scripts" ]]; then
+      # firmware/ is not referenced by any deployed daq/analysis/scripts
+      # code path (verified 2026-08-08); excluding it saves ~187 MB/release.
+      git -C "$cache" archive "${RESOLVED_SHA[$repo]}" \
+        | tar -x -C "$dest" --exclude='firmware'
+    else
+      git -C "$cache" archive "${RESOLVED_SHA[$repo]}" | tar -x -C "$dest"
+    fi
   done
 
   mkdir -p "${RELEASE_DIR}/ext"
-  cp -a "${EXT_SRC}/fzf" "${EXT_SRC}/mdcat" "${RELEASE_DIR}/ext/"
-  if command -v uv >/dev/null 2>&1; then
-    cp -a "$(command -v uv)" "${RELEASE_DIR}/ext/uv"
-  fi
+  local bin
+  for bin in fzf mdcat; do
+    [[ -x "${EXT_SRC}/${bin}" ]] || die "required binary '$bin' not found in EXT_SRC ($EXT_SRC)"
+    cp -a "${EXT_SRC}/${bin}" "${RELEASE_DIR}/ext/${bin}"
+    EXT_SHA256["$bin"]="$(sha256sum "${EXT_SRC}/${bin}" | awk '{print $1}')"
+  done
+  # uv is a build tool, not a runtime dependency of the deployed stack (D6);
+  # it is deliberately not vendored into ext/ or put on the release PATH.
 
-  log "building venv with $PYTHON"
+  log "building venv with $PYTHON (--link-mode=copy: a release must not hold hardlinks into a developer's ~/.cache/uv, or sealing/pruning one release can silently un-seal another)"
   uv venv --python "$PYTHON" "${RELEASE_DIR}/venv"
-  uv pip sync "${SELF}/requirements-py38.txt" --python "${RELEASE_DIR}/venv/bin/python"
+  uv pip sync "${SELF}/requirements-py38.txt" --python "${RELEASE_DIR}/venv/bin/python" --link-mode=copy
 }
 
 # ============================================================
@@ -240,8 +314,10 @@ write_manifest() {
     printf '{\n'
     printf '  "release_id": "%s",\n' "$RELEASE_ID"
     printf '  "timestamp_utc": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '  "dirty": %s,\n' "$([[ $DEV_MODE -eq 1 ]] && echo true || echo false)"
     printf '  "deploy_sh_sha": "%s",\n' "$deploy_sha"
     printf '  "lock_sha256": "%s",\n' "$lock_hash"
+    printf '  "venv_link_mode": "copy",\n'
     printf '  "python_version": "%s",\n' "$py_version"
     printf '  "python_path": "%s",\n' "$PYTHON"
     printf '  "invocation_args": "%s",\n' "$(printf '%s ' "${ORIGINAL_ARGS[@]}" | sed 's/ $//' | sed 's/"/\\"/g')"
@@ -249,12 +325,23 @@ write_manifest() {
     local i=0
     for repo in "${REPOS[@]}"; do
       i=$((i+1))
-      rvar_req="REF_${repo^^}"
-      printf '    "%s": {"requested": "%s", "sha": "%s"}%s\n' \
-        "$repo" "${!rvar_req}" "${RESOLVED_SHA[$repo]}" \
-        "$([[ $i -lt ${#REPOS[@]} ]] && echo , )"
+      if [[ -n "${WORKTREE_OVERRIDE[$repo]:-}" ]]; then
+        local wdesc
+        wdesc="$(git -C "${WORKTREE_OVERRIDE[$repo]}" describe --always --dirty 2>/dev/null || echo unknown)"
+        printf '    "%s": {"worktree": "%s", "describe": "%s"}%s\n' \
+          "$repo" "${WORKTREE_OVERRIDE[$repo]}" "$wdesc" \
+          "$([[ $i -lt ${#REPOS[@]} ]] && echo , )"
+      else
+        local rvar_req="REF_${repo^^}"
+        printf '    "%s": {"requested": "%s", "sha": "%s"}%s\n' \
+          "$repo" "${!rvar_req}" "${RESOLVED_SHA[$repo]}" \
+          "$([[ $i -lt ${#REPOS[@]} ]] && echo , )"
+      fi
     done
     printf '  },\n'
+    printf '  "scripts_firmware_excluded": true,\n'
+    printf '  "ext": {"fzf_sha256": "%s", "mdcat_sha256": "%s", "source": "%s"},\n' \
+      "${EXT_SHA256[fzf]:-}" "${EXT_SHA256[mdcat]:-}" "$EXT_SRC"
     printf '  "pip_freeze": %s\n' "$(printf '%s' "$freeze" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().splitlines()))')"
     printf '}\n'
   } > "${RELEASE_DIR}/manifest.json"
@@ -264,6 +351,10 @@ write_manifest() {
 # seal_release (D3)
 # ============================================================
 seal_release() {
+  if [[ "$DEV_MODE" -eq 1 ]]; then
+    log "dev release: not sealed (D3 does not apply under ${STORE}/dev)"
+    return 0
+  fi
   chmod -R a-w "$RELEASE_DIR"
 }
 
@@ -271,6 +362,7 @@ seal_release() {
 # prune (D14)
 # ============================================================
 prune() {
+  [[ "$DEV_MODE" -eq 1 ]] && return 0
   local keep="$KEEP"
   local releases_dir="${STORE}/releases"
   [[ -d "$releases_dir" ]] || return 0
@@ -305,7 +397,12 @@ prune() {
     [[ "$removed" -ge "$to_remove" ]] && break
     [[ -n "${protected[$d]:-}" ]] && { log "prune: keeping protected release $d"; continue; }
     log "prune: removing $d"
-    chmod -R u+w "$d"
+    # Directories only: deletion needs write on the containing directory,
+    # not on the files themselves. A blanket `chmod -R u+w` here previously
+    # reached into files hardlinked from another (still-live) sealed
+    # release's venv via uv's cache and un-sealed it. --link-mode=copy
+    # (see build_release) makes this defensive; this keeps it that way.
+    find "$d" -type d -exec chmod u+w {} +
     rm -rf "$d"
     removed=$((removed+1))
   done
@@ -333,11 +430,16 @@ main() {
   done
   log "python: $("${RELEASE_DIR}/venv/bin/python" -V 2>&1)"
   log ""
-  log "to use this release directly, add to a site file:"
-  log "  SLACUBE_RELEASE=${RELEASE_DIR}"
-  log ""
-  log "to promote (NOT executed by this script):"
-  log "  ln -sfn ${RELEASE_DIR} ${STORE}/current"
+  if [[ "$DEV_MODE" -eq 1 ]]; then
+    log "dev release (unsealed, not promotable): ${RELEASE_DIR}"
+    log "point a personal site file's SLACUBE_RELEASE at it directly."
+  else
+    log "to use this release directly, add to a site file:"
+    log "  SLACUBE_RELEASE=${RELEASE_DIR}"
+    log ""
+    log "to promote (NOT executed by this script):"
+    log "  ln -sfn ${RELEASE_DIR} ${STORE}/current"
+  fi
 }
 
 main "$@"

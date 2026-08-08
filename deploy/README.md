@@ -18,8 +18,17 @@ in the `slacube` workspace (D1-D15).
 ## Release / site / state model
 
 - **Release** (`<store>/releases/<UTC>-<daq-sha7>/`): immutable, generated,
-  relocatable. Code, venv, vendored `fzf`/`mdcat`/`uv`, a generated
-  `env.sh`, and `manifest.json`. Sealed read-only after build (D3).
+  relocatable. Code (`git archive` export, no `.git`, `firmware/` excluded
+  from `scripts` -- unused by any deployed command), venv (built with
+  `--link-mode=copy`, not hardlinked, so a release never shares inodes with
+  a developer's `~/.cache/uv`), vendored `fzf`/`mdcat` (not `uv` -- that's a
+  build tool, D6), a generated `env.sh`, and `manifest.json`. Sealed
+  read-only after build (D3).
+- **Local mirror cache** (`<store>/.cache/<repo>.git`, store-owned, bare):
+  fetched from `origin` on every deploy, so redeploys are incremental
+  instead of a fresh `--depth 1` clone. A ref that exists only in the
+  mirror (e.g. pushed directly, not via GitHub) still resolves -- see
+  "Working without a push to GitHub" below.
 - **Site file** (per account, hand-written once, e.g. `~/slacube-dev.sh`
   from `site.sh.example`): selects a release, sets per-account state paths,
   the dropbox, and the PACMAN address. Never regenerated.
@@ -39,12 +48,18 @@ git clone /home/slacube/app/etc /data/slacube/config-archive
 chgrp -R neutrino /data/slacube/config-archive
 chmod -R g+w /data/slacube/config-archive
 find /data/slacube/config-archive -type d -exec chmod g+s {} +
+
+# Store-owned ext staging (D11) -- read once from production, never again.
+# EXT_SRC in targets/*.conf points here, not at /home/slacube.
+mkdir -p /opt/slacube/ext
+cp -a /home/slacube/app/ext/fzf /home/slacube/app/ext/mdcat /opt/slacube/ext/
 ```
 
 Cloning `etc` from the local production path (not GitHub) is what preserves
-history GitHub doesn't have yet (tracker `issue-002`). This is a *read* of
-`/home/slacube/app/etc` — the only interaction Round 1 has with the
-shifter's install.
+history GitHub doesn't have yet (tracker `issue-002`). Both of these are
+*reads* of `/home/slacube` -- the only interaction Round 1 has with the
+shifter's install. `<store>/.cache/` needs no manual step: `deploy.sh`
+creates each repo's bare mirror lazily on first `resolve_refs`.
 
 ## Bootstrap
 
@@ -84,6 +99,9 @@ Every value in the target `.conf` can be overridden per invocation:
 | `--dropbox PATH` | dropbox reported in this release's banner |
 | `--pacman-addr HOST` | recorded in manifest + banner only — see "Hardware & data safety" |
 | `--keep N` | releases to retain (D14) |
+| `--dev` | build under `<store>/dev/<user>/<name>` instead of `releases/`; unsealed, never promotable |
+| `--name NAME` | dev release name (required with `--dev`) |
+| `--worktree REPO=PATH` | dev only: symlink a repo to a local worktree instead of exporting a resolved ref; repeatable |
 
 `deploy.sh --from-manifest <release>/manifest.json [overrides...]` rebuilds
 the exact same refs a past release used, defaulting all `--ref` values from
@@ -119,6 +137,48 @@ per-repo SHA, Python version, the `source` line for a site file, and the
     --output-file deploy/requirements-py38.txt
   ```
 
+## Iterating without a round-trip through the release/promote model
+
+Two different problems, two different mechanisms -- don't reach for the
+heavier one when the lighter one covers it.
+
+**Committed work-in-progress, not ready to push to GitHub yet.** No new
+mechanism needed: `REMOTE_*` is a plain git remote and `<store>/.cache/`
+already holds a bare mirror per repo. Push a branch straight into it and
+deploy against that ref:
+
+```sh
+git push nu-daq01-ir2:/opt/slacube/.cache/slacube-daq.git HEAD:wip
+ssh nu-daq01-ir2 'deploy/deploy.sh --config deploy/targets/slacube-dev.conf --ref daq=wip'
+```
+
+`resolve_refs` tries `origin` first and falls back to a ref that only
+exists in the local mirror, so this works with no config change. The
+result is a normal, sealed, real-SHA release -- just built from a branch
+GitHub has never seen.
+
+**Genuinely uncommitted code.** `--dev --worktree` builds an unsealed
+release under `<store>/dev/<user>/<name>` that symlinks named repos to a
+local worktree instead of exporting a git ref. It is never written under
+`releases/`, is never sealed, and can never be promoted (`current` only
+ever points into `releases/`). The manifest is stamped `"dirty": true`
+with each linked repo's `git describe --dirty`. If there's no shared
+filesystem between your workstation and the deploy host, `rsync` the
+worktree over first:
+
+```sh
+rsync -a --delete --exclude=.git/index.lock src/daq/ nu-daq01-ir2:~/dev/daq/
+ssh nu-daq01-ir2 'deploy/deploy.sh --config deploy/targets/slacube-dev.conf \
+  --dev --name wip --worktree daq=~/dev/daq'
+```
+
+The venv is built once; after that, further edits only need the `rsync` --
+the dev release's symlinked repo picks them up immediately, no rebuild.
+Point a personal site file's `SLACUBE_RELEASE` at the dev release directly;
+never name it from a discoverable site file the way `prune` looks for
+(`prune` never touches `dev/` at all, but nothing there is retention-safe
+either -- it's scratch space, not a release).
+
 ## Hardware & data safety
 
 - `pacman19.local` (`10.11.10.110`) is one physical PACMAN, shared by every
@@ -140,17 +200,24 @@ per-repo SHA, Python version, the `source` line for a site file, and the
   via `BASH_SOURCE` — never hand-edit a release's `env.sh`, and never add a
   path placeholder to the template. Per-account values belong in the site
   file, not here.
-- Every release's `daq`, `analysis`, `scripts`, and `etc` checkouts are on a
-  **detached HEAD** at a resolved SHA. That is correct for the release's own
-  pinned `etc` (read as `SLACUBE_LAYOUT`'s input). It is *not* the config
-  archive: `SLACUBE_GIT_DIR` in the site file points at the separate,
-  shared, branch-checked-out `/data/slacube/config-archive`, so `slacube cfg
-  archive` (`bin/slacube:708-709`) always commits onto a real branch, never
-  into a release's detached checkout.
+- Every release's `daq`, `analysis`, `scripts`, and `etc` directories are
+  `git archive` exports at a resolved SHA -- **no `.git`, no VCS state**.
+  Nothing in `bin/slacube`, `analysis/`, or `scripts/larpix_qc/` shells out
+  to git against them (verified 2026-08-08); the only git target at
+  runtime is `SLACUBE_GIT_DIR`, which the site file points at the separate,
+  shared, branch-checked-out `/data/slacube/config-archive`, so `slacube
+  cfg archive` (`bin/slacube:708-709`) always commits onto a real branch.
+  This is also why a release cannot orphan `cfg archive` commits by
+  construction, not just by convention.
 - A release is sealed `chmod -R a-w` after build. This is load-bearing, not
   cosmetic — the store is setgid `neutrino` and a typical developer `umask`
   of `0002` would otherwise leave a running release writable by the shifter
-  account.
+  account. The venv is built with `--link-mode=copy` specifically so the
+  seal is real: uv's default hardlinks from `~/.cache/uv` mean `chmod -R
+  a-w` reaches into a developer's cache (observed: it did, on the first
+  release), and `prune`'s cleanup of an old release can silently re-widen
+  permissions on a still-live release sharing those inodes. Copy mode costs
+  ~280 MB/release; that is the price of the seal meaning what it says.
 
 ## Known gaps, filed rather than fixed here
 
