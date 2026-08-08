@@ -233,7 +233,7 @@ write_manifest() {
   local deploy_sha lock_hash freeze py_version repo
   deploy_sha="$(git -C "$SELF" rev-parse HEAD 2>/dev/null || echo unknown)"
   lock_hash="$(sha256sum "${SELF}/requirements-py38.txt" | awk '{print $1}')"
-  freeze="$("${RELEASE_DIR}/venv/bin/python" -m pip freeze 2>/dev/null || true)"
+  freeze="$(uv pip freeze --python "${RELEASE_DIR}/venv/bin/python" 2>/dev/null || true)"
   py_version="$("${RELEASE_DIR}/venv/bin/python" -V 2>&1)"
 
   {
