@@ -488,6 +488,7 @@ cmd_threshold()
 			[[ -d $cfg ]] || die "Error: cfg not found"
 			write_rc CFG_DIR $(realpath "$cfg")
 			;;
+    help) shift; show_help threshold ;;
     *) echo "Usage: $PROGRAM threshold [start|set|copy|adjust|plot|help]"
   esac
 }
@@ -600,7 +601,7 @@ cmd_pedmon()
 
       plot_ped_mon.py ped_mon -p "$@"
       ;;
-    help) shift; show_help selftrig ;;
+    help) shift; show_help ped-mon ;;
     *) echo "Usage: $PROGRAM ped-mon [start|stop|analyze|plot|help]"
   esac
 }
@@ -739,7 +740,7 @@ cmd_power()
 # main() {{{
 # ====================================
 # check workdir except running with no argument or "env,help,power"
-[[ $# -eq 0 || "$1" == "env" || "$1" == "help" || "$1" == "power" ]] || check_workdir
+[[ $# -eq 0 || "$1" == "env" || "$1" == "help" || "$1" == "power" || "$2" == "help" ]] || check_workdir
 
 case "$1" in
   env)         shift; cmd_env "$@"        ;;

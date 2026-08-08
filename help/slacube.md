@@ -79,6 +79,12 @@ ENVIRONMENT
 `SLACUBE_LAYOUT`
 :   Tile layout (in simplified `npy` format) for diagnostics plots.
 
+`SLACUBE_APP_DIR`
+:   Root of the deployed release (or dev worktree). Set by the release's `env.sh`.
+
+`$NQDIR`, `$NQDONEDIR`, `$NQFAILDIR`
+:   Job queue directories used by `nq` (a host-provided, not vendored, runtime dependency) to convert and move self-triggered data in the background. See `slacube run help`.
+
 SEE ALSO
 ========
 `slacube help`
