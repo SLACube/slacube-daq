@@ -178,7 +178,7 @@ make_workdir()
 		&& touch "$RC_LOCAL" \
     && cp -r ${SLACUBE_QC_SCRIPTS}/io . \
 		&& cp ${SLACUBE_QC_SCRIPTS}/bad_channels.json $workdir/bad_channels-default.json \
-		&& write_rc BAD_CHANNEL_FILE $workdir/bad-channel_default.json 
+		&& write_rc BAD_CHANNEL_FILE $workdir/bad_channels-default.json 
 
 	[[ $? -eq 0 ]] || die "Error: Fail to crate working directory!"
   cat >"$workdir/setup.sh" <<-_EOF
