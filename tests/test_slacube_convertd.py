@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 import time as _time
+import types
 from datetime import datetime
 
 # Load bin/slacube-convertd as a Python module (it has no .py extension).
@@ -630,6 +631,75 @@ with tmp_layout() as L:
         shutil.rmtree(fake_dir, ignore_errors=True)
 
 
+# ---------------------------------------------------------- G2: workdir fallback is per-daemon
+print("\n[G2: cmd_serve workdir fallback is $SLACUBE_SPOOL/.work, not dirname(spool)]")
+with tmp_layout() as L:
+    saved = {}
+    for k in ("SLACUBE_SPOOL", "SLACUBE_DROPBOX", "SLACUBE_RAW_CACHE", "SLACUBE_WORKDIR"):
+        saved[k] = os.environ.pop(k, None)
+    os.environ["SLACUBE_SPOOL"] = L["spool"]
+    os.environ["SLACUBE_DROPBOX"] = L["dropbox"]
+    os.environ["SLACUBE_RAW_CACHE"] = L["raw_cache"]
+    # SLACUBE_WORKDIR deliberately left unset -- this is the fallback case.
+    try:
+        args = types.SimpleNamespace(once=True)
+        convertd.cmd_serve(args, os.environ)
+        fallback = os.path.join(L["spool"], ".work")
+        check(os.path.isdir(fallback),
+              "cmd_serve creates $SLACUBE_SPOOL/.work when SLACUBE_WORKDIR is unset")
+        shared_parent_work = os.path.join(os.path.dirname(L["spool"]), ".work")
+        check(not os.path.isdir(shared_parent_work),
+              "fallback is not dirname(spool)/.work (the pre-fix shared location)")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# ---------------------------------------------------------- G3: refuse cross-device workdir/raw_cache
+print("\n[G3: cmd_serve refuses when workdir and raw_cache are on different devices]")
+with tmp_layout() as L:
+    raised = False
+    try:
+        convertd._check_same_device(L["workdir"], L["raw_cache"])
+    except convertd.ConvertdError:
+        raised = True
+    check(not raised, "same-device workdir/raw_cache passes the G3 check")
+
+    # Two real filesystems are not guaranteed in a test sandbox, so the
+    # differing-device case is exercised by monkeypatching os.stat to
+    # report distinct st_dev values for the two paths under test.
+    real_stat = convertd.os.stat
+
+    class _FakeStatResult(object):
+        def __init__(self, st_dev):
+            self.st_dev = st_dev
+
+    def _fake_stat(path, *a, **kw):
+        if path == L["workdir"]:
+            return _FakeStatResult(1)
+        if path == L["raw_cache"]:
+            return _FakeStatResult(2)
+        return real_stat(path, *a, **kw)
+
+    convertd.os.stat = _fake_stat
+    try:
+        raised = False
+        msg = ""
+        try:
+            convertd._check_same_device(L["workdir"], L["raw_cache"])
+        except convertd.ConvertdError as exc:
+            raised = True
+            msg = str(exc)
+        check(raised, "different-device workdir/raw_cache refuses (ConvertdError)")
+        check(raised and L["workdir"] in msg and L["raw_cache"] in msg,
+              "refusal names both paths: %r" % (msg,))
+    finally:
+        convertd.os.stat = real_stat
+
+
 # ---------------------------------------------------------- CLI: status text and --json
 print("\n[CLI: status text and --json]")
 with tmp_layout() as L:
@@ -691,32 +761,59 @@ with tmp_layout() as L:
           "CLI ack moves failed -> done")
 
 
-# ---------------------------------------------------------- CLI: install/uninstall dry-run checks
-print("\n[CLI: install writes unit file with substituted site-file path]")
+# ---------------------------------------------------------- CLI: install refuses without a site file (G1)
+print("\n[G1: install refuses when the site file does not exist]")
 with tmp_layout() as L:
+    xdg = os.path.join(L["root"], "xdg")
     rc, out, err = run_cli(
         ["install"],
         env_extra={
             "HOME": L["root"],
             "SLACUBE_SPOOL": L["spool"],
             "SLACUBE_DROPBOX": L["dropbox"],
+            "XDG_CONFIG_HOME": xdg,
+            "PATH": "/usr/bin:/bin",
+        },
+    )
+    check(rc == 1, "install refuses with no site file: rc=%d out=%r err=%r" % (rc, out, err))
+    check("error:" in err and ".slacube-site.sh" in err,
+          "install names the missing site file: %r" % (err,))
+    unit_path = os.path.join(xdg, "systemd", "user", "slacube-convert.service")
+    check(not os.path.isfile(unit_path),
+          "no unit file written when the site file is missing")
+
+
+# ---------------------------------------------------------- CLI: install/uninstall dry-run checks
+print("\n[CLI: install writes unit file with substituted site-file path]")
+with tmp_layout() as L:
+    site_file = os.path.join(L["root"], "site.sh")
+    with open(site_file, "w") as fh:
+        fh.write("# fake site file for tests\n")
+    rc, out, err = run_cli(
+        ["install"],
+        env_extra={
+            "HOME": L["root"],
+            "SLACUBE_SPOOL": L["spool"],
+            "SLACUBE_DROPBOX": L["dropbox"],
+            "SLACUBE_SITE_FILE": site_file,
             "XDG_CONFIG_HOME": os.path.join(L["root"], "xdg"),
             "PATH": "/usr/bin:/bin",
         },
     )
     # The unit-file write should succeed; systemctl calls may fail in this sandbox
-    # The actual path is printed to stdout as `wrote <path>`.
+    # The actual path is printed to stdout as `wrote <path> (site file: <site_file>)`.
     unit = None
     for line in out.splitlines():
         if line.startswith("wrote "):
-            unit = line[len("wrote "):].strip()
+            unit = line[len("wrote "):].split(" (site file:")[0].strip()
             break
     check(unit is not None and os.path.isfile(unit),
           "install wrote unit file: %r (rc=%d err=%r)" % (unit, rc, err))
+    check(site_file in out, "install prints the resolved site file on success: %r" % (out,))
     with open(unit) as fh:
         content = fh.read()
     check("slacube-convertd serve" in content, "unit file references slacube-convertd serve")
-    check("/.slacube-site.sh" in content, "unit file has default ~/.slacube-site.sh")
+    check(site_file in content, "unit file has the configured site file")
 
 
 # ---------------------------------------------------------- concurrency (finding 2)
@@ -964,6 +1061,9 @@ with tmp_layout() as L:
 print("\n[CLI: install with no systemctl -> clean error + exit 1]")
 with tmp_layout() as L:
     empty_dir = tempfile.mkdtemp(prefix="empty_path_")
+    site_file = os.path.join(L["root"], "site.sh")
+    with open(site_file, "w") as fh:
+        fh.write("# fake site file for tests\n")
     try:
         rc, out, err = run_cli(
             ["install"],
@@ -971,6 +1071,7 @@ with tmp_layout() as L:
                 "HOME": L["root"],
                 "SLACUBE_SPOOL": L["spool"],
                 "SLACUBE_DROPBOX": L["dropbox"],
+                "SLACUBE_SITE_FILE": site_file,
                 "XDG_CONFIG_HOME": os.path.join(L["root"], "xdg"),
                 "PATH": empty_dir,
             },

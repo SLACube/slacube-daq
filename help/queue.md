@@ -82,6 +82,9 @@ install
     `systemctl --user daemon-reload && systemctl --user enable --now
     slacube-convert.service`. The unit sources `$SLACUBE_SITE_FILE`
     (default `~/.slacube-site.sh`) before starting `slacube-convertd serve`.
+    Refuses (exit 1, no unit written) if that site file does not exist or
+    is not readable -- a unit that sources a missing file would
+    crash-loop under `Restart=always` forever.
 
 uninstall
 :   Run `systemctl --user disable --now slacube-convert.service` and
@@ -139,8 +142,15 @@ ENVIRONMENT
 
 `$SLACUBE_WORKDIR`
 :   Scratch directory where the daemon writes the `.part` intermediate
-    before publishing to the dropbox. Defaults to the parent of
-    `$SLACUBE_SPOOL` if unset.
+    before publishing to the dropbox. If unset, defaults to
+    `$SLACUBE_SPOOL/.work` (created on startup) rather than the parent of
+    `$SLACUBE_SPOOL` -- the latter is shared by every account's daemon
+    and would let two users' `.part` files collide by name. The daemon
+    refuses to start (exit 1) if `$SLACUBE_WORKDIR` and
+    `$SLACUBE_RAW_CACHE` are not on the same filesystem: the raw-to-cache
+    move is a same-device `os.rename`, and a cross-device site file would
+    otherwise fail that move only after the converted file is already
+    published.
 
 `$SLACUBE_CONVERT_POLL`
 :   Poll interval (seconds) for `serve`. Default `5`.

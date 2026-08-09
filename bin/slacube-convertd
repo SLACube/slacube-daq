@@ -744,11 +744,23 @@ def _site_file():
 
 
 def install_unit():
-    """Write the systemd --user unit file."""
+    """Write the systemd --user unit file.
+
+    Refuses (raises ConvertdError) when the site file `_site_file()`
+    resolves to is not a readable file. Writing a unit that sources a
+    missing file would crash-loop it every RestartSec, forever, with
+    nothing but a bare shell error in the journal (G1).
+    """
+    site_file = _site_file()
+    if not os.path.isfile(site_file) or not os.access(site_file, os.R_OK):
+        raise ConvertdError(
+            "site file not found or unreadable: %s (export "
+            "SLACUBE_SITE_FILE, or create it, before installing the unit)"
+            % site_file)
     unit_dir = _unit_dir()
     os.makedirs(unit_dir, exist_ok=True)
     unit_path = os.path.join(unit_dir, SYSTEMD_UNIT_NAME)
-    content = UNIT_TEMPLATE.format(site_file=_site_file())
+    content = UNIT_TEMPLATE.format(site_file=site_file)
     with open(unit_path, "w") as fh:
         fh.write(content)
     return unit_path
@@ -808,11 +820,40 @@ def build_parser():
     return p
 
 
+def _check_same_device(workdir, raw_cache):
+    """Refuse (ConvertdError) unless workdir and raw_cache share a device.
+
+    `_move_raw_to_cache` uses `os.rename`, which requires both sides of
+    the rename to be on one filesystem; an EXDEV there would surface
+    only after the converted file is already published to the dropbox
+    (G3). Checked at startup so a misconfigured site file fails loudly
+    once, instead of failing every job after the fact.
+    """
+    wd_dev = os.stat(workdir).st_dev
+    rc_dev = os.stat(raw_cache).st_dev
+    if wd_dev != rc_dev:
+        raise ConvertdError(
+            "SLACUBE_WORKDIR (%s, device %d) and SLACUBE_RAW_CACHE (%s, "
+            "device %d) are on different filesystems; os.rename in "
+            "_move_raw_to_cache requires one device"
+            % (workdir, wd_dev, raw_cache, rc_dev))
+
+
 def cmd_serve(args, env):
     spool = _require_env("SLACUBE_SPOOL")
     dropbox = _require_env("SLACUBE_DROPBOX")
     raw_cache = _require_env("SLACUBE_RAW_CACHE")
-    workdir = os.environ.get("SLACUBE_WORKDIR", os.path.dirname(spool))
+    workdir = os.environ.get("SLACUBE_WORKDIR")
+    if not workdir:
+        # G2: no site file exports a bare SLACUBE_WORKDIR -- that name is
+        # written per-run by `slacube env create`'s setup.sh, not by the
+        # site file itself. The old fallback, dirname(spool), is shared
+        # by every account's daemon; use a directory inside *this*
+        # daemon's own spool instead, so cross-account .part collisions
+        # are structurally impossible.
+        workdir = os.path.join(spool, ".work")
+        os.makedirs(workdir, exist_ok=True)
+    _check_same_device(workdir, raw_cache)
     with spool_lock(spool):
         _serve_loop(spool, dropbox, raw_cache, workdir, once=args.once)
 
@@ -883,7 +924,7 @@ def cmd_drain(args, env):
 
 def cmd_install(args, env):
     unit_path = install_unit()
-    sys.stdout.write("wrote %s\n" % unit_path)
+    sys.stdout.write("wrote %s (site file: %s)\n" % (unit_path, _site_file()))
     rc, out, err = _run(["systemctl", "--user", "daemon-reload"])
     if rc != 0:
         sys.stderr.write("daemon-reload failed: %s\n" % err)
