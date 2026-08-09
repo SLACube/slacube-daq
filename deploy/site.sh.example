@@ -16,10 +16,24 @@
 SLACUBE_RELEASE=/opt/slacube/current           # developer: .../releases/<pick>
 
 # --- per-account state ---------------------------------------------------
-export SLACUBE_DEFAULT_WORKDIR="${HOME}/workdir"
-export NQDIR="${HOME}/queue"
-export NQDONEDIR="${NQDIR}/done"
-export NQFAILDIR="${NQDIR}/fail"
+
+# /scratch is on-store NVMe, separate from the /data/slacube tiers below.
+# Spool is per-user because each user runs their own slacube-convertd.
+export SLACUBE_DEFAULT_WORKDIR="/scratch/slacube/work/${USER}"
+export SLACUBE_RAW_CACHE="/scratch/slacube/raw"
+export SLACUBE_SPOOL="/scratch/slacube/spool/${USER}"
+
+# --- guardrail variables (override only when needed) ---------------------
+# Defaults live in guard_acquisition (bin/slacube); this file just makes
+# every knob visible to the operator. Uncomment and edit to override.
+#export SLACUBE_MAX_CONSECUTIVE_FAIL=3
+#export SLACUBE_MAX_BACKLOG=8
+#export SLACUBE_MIN_FREE=26843545600                # 25 GiB, on $SLACUBE_WORKDIR
+#export SLACUBE_MIN_FREE_DROPBOX=53687091200        # 50 GiB, on $SLACUBE_DROPBOX
+#export SLACUBE_RESUME_FREE=53687091200             # 2 * SLACUBE_MIN_FREE
+#export SLACUBE_RESUME_FREE_DROPBOX=107374182400    # 2 * SLACUBE_MIN_FREE_DROPBOX
+#export SLACUBE_GUARD_POLL=60
+#export SLACUBE_MAX_HOLD=3600
 
 # --- hardware / data safety (D10) ----------------------------------------
 # NEVER point this at /data/slacube/dropbox from a developer account --

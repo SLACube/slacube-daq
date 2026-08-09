@@ -61,6 +61,173 @@ yes_no()
   read -r -p "$1 [y/N] " answer
   [[ $answer == [yY] ]] || exit 1
 }
+guard_acquisition()
+{
+  # Guardrail for `slacube run start` and `slacube ped-mon start`.
+  # Blocks (returns 0) when safe to acquire, or writes 0 to .state and
+  # returns non-zero to ask the caller's existing loop to exit.
+  #
+  # Reads the following (overridable via the site file):
+  #   SLACUBE_WORKDIR, SLACUBE_DROPBOX (paths to check free space on)
+  #   SLACUBE_SPOOL  (for `slacube-convertd status --json`)
+  # And the guardrail knobs below, each with a default.
+  local max_consec=${SLACUBE_MAX_CONSECUTIVE_FAIL:-3}
+  local max_backlog=${SLACUBE_MAX_BACKLOG:-8}
+  local min_free=${SLACUBE_MIN_FREE:-$((25 * 1024 * 1024 * 1024))}
+  local min_free_drop=${SLACUBE_MIN_FREE_DROPBOX:-$((50 * 1024 * 1024 * 1024))}
+  local resume_free=${SLACUBE_RESUME_FREE:-$((2 * min_free))}
+  local resume_free_drop=${SLACUBE_RESUME_FREE_DROPBOX:-$((2 * min_free_drop))}
+  local poll=${SLACUBE_GUARD_POLL:-60}
+  local max_hold=${SLACUBE_MAX_HOLD:-3600}
+
+  [[ -d "$SLACUBE_WORKDIR" ]] \
+    || { echo "guard: \$SLACUBE_WORKDIR not set or not a directory" >&2; return 2; }
+  [[ -d "$SLACUBE_DROPBOX" ]] \
+    || { echo "guard: \$SLACUBE_DROPBOX not set or not a directory" >&2; return 2; }
+
+  local -i elapsed=0
+  while :; do
+    # ---- rule 1: free space on WORKDIR and DROPBOX ----
+    # Note: a command substitution's exit status is lost to the surrounding
+    # `if`; capture df's exit status explicitly so a non-zero rc is honored.
+    local free_work free_drop df_rc
+    free_work=$(df --output=avail -B1 "$SLACUBE_WORKDIR" 2>/dev/null)
+    df_rc=$?
+    if (( df_rc != 0 )); then
+      echo "guard: df failed for \$SLACUBE_WORKDIR ($SLACUBE_WORKDIR)" >&2
+      echo 0 > .state 2>/dev/null || true
+      return 1
+    fi
+    free_work=$(printf '%s\n' "$free_work" | tail -1)
+    free_drop=$(df --output=avail -B1 "$SLACUBE_DROPBOX" 2>/dev/null)
+    df_rc=$?
+    if (( df_rc != 0 )); then
+      echo "guard: df failed for \$SLACUBE_DROPBOX ($SLACUBE_DROPBOX)" >&2
+      echo 0 > .state 2>/dev/null || true
+      return 1
+    fi
+    free_drop=$(printf '%s\n' "$free_drop" | tail -1)
+    if (( free_work < min_free || free_drop < min_free_drop )); then
+      # Hold: report free/backlog/quarantined/elapsed, sleep, re-check.
+      # Backlog depth is best-effort: a missing convertd or empty spool
+      # is treated as backlog=0 (still informative).
+      local status_json depth=0 quarantined=0 newest_q=""
+      status_json=$(slacube-convertd status --json 2>/dev/null || true)
+      if [[ -n "$status_json" ]]; then
+        depth=$(printf '%s' "$status_json" \
+          | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("pending",0)+d.get("running",0))' \
+            2>/dev/null || echo 0)
+        quarantined=$(printf '%s' "$status_json" \
+          | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("failed",0))' \
+            2>/dev/null || echo 0)
+      fi
+      echo "guard: workdir_free=${free_work}B dropbox_free=${free_drop}B backlog=${depth} quarantined=${quarantined} elapsed=${elapsed}s; waiting on free space"
+      sleep "$poll"
+      elapsed=$((elapsed + poll))
+      # Re-read free space now that we've slept.
+      local df_rc2 free_work2 free_drop2
+      free_work2=$(df --output=avail -B1 "$SLACUBE_WORKDIR" 2>/dev/null)
+      df_rc2=$?
+      if (( df_rc2 != 0 )); then
+        echo "guard: df failed for \$SLACUBE_WORKDIR ($SLACUBE_WORKDIR)" >&2
+        echo 0 > .state 2>/dev/null || true
+        return 1
+      fi
+      free_work2=$(printf '%s\n' "$free_work2" | tail -1)
+      free_drop2=$(df --output=avail -B1 "$SLACUBE_DROPBOX" 2>/dev/null)
+      df_rc2=$?
+      if (( df_rc2 != 0 )); then
+        echo "guard: df failed for \$SLACUBE_DROPBOX ($SLACUBE_DROPBOX)" >&2
+        echo 0 > .state 2>/dev/null || true
+        return 1
+      fi
+      free_drop2=$(printf '%s\n' "$free_drop2" | tail -1)
+      # Resume only once both filesystems are above their RESUME_FREE
+      # thresholds (hysteresis prevents oscillation around MIN_FREE).
+      if (( free_work2 <= resume_free || free_drop2 <= resume_free_drop )); then
+        if (( elapsed >= max_hold )); then
+          echo "guard: held ${elapsed}s >= MAX_HOLD (${max_hold}); stopping" >&2
+          echo 0 > .state 2>/dev/null || true
+          return 1
+        fi
+        continue
+      fi
+      # Resume: refresh the values the rest of the function will read.
+      free_work=$free_work2
+      free_drop=$free_drop2
+    fi
+
+    # ---- rule 2 / 3 / 4: convertd status ----
+    local status_rc status_json depth=0 quarantined=0 newest_q=""
+    status_json=$(slacube-convertd status --json 2>/dev/null)
+    status_rc=$?
+    if [[ -n "$status_json" ]]; then
+      depth=$(printf '%s' "$status_json" \
+        | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("pending",0)+d.get("running",0))' \
+          2>/dev/null || echo 0)
+      quarantined=$(printf '%s' "$status_json" \
+        | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("failed",0))' \
+          2>/dev/null || echo 0)
+      # Newest quarantined job name: pick the lexicographically greatest
+      # failed/<job>.json (timestamp-sorted basenames sort chronologically).
+      newest_q=$(ls -1 "${SLACUBE_SPOOL}/failed" 2>/dev/null | sort | tail -1 || true)
+      newest_q=${newest_q%.json}
+    fi
+
+    # rule 3: consecutive failures (exit_code 1) -> STOP, not hold.
+    if (( status_rc == 1 )); then
+      echo "guard: convertd reports ${quarantined} consecutive failures (>= ${max_consec}); stopping" >&2
+      echo 0 > .state 2>/dev/null || true
+      return 1
+    fi
+
+    # rule 4: isolated failures (exit_code 2) -> warn, proceed.
+    if (( status_rc == 2 )); then
+      echo "guard: ${quarantined} quarantined job(s) in ${SLACUBE_SPOOL}/failed/ (newest: ${newest_q:-none}); proceeding"
+    fi
+
+    # rule 2: backlog hold, resume at <= MAX_BACKLOG/2.
+    local half=$((max_backlog / 2))
+    if (( depth > max_backlog )); then
+      echo "guard: backlog=${depth} > MAX_BACKLOG (${max_backlog}); waiting on backlog"
+      sleep "$poll"
+      elapsed=$((elapsed + poll))
+      if (( elapsed >= max_hold )); then
+        echo "guard: held ${elapsed}s >= MAX_HOLD (${max_hold}); stopping" >&2
+        echo 0 > .state 2>/dev/null || true
+        return 1
+      fi
+      # Re-check backlog now that we've slept; resume only when it has
+      # dropped to <= half the trigger threshold (hysteresis).
+      local status_json2 depth2
+      status_json2=$(slacube-convertd status --json 2>/dev/null)
+      if [[ -n "$status_json2" ]]; then
+        depth2=$(printf '%s' "$status_json2" \
+          | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("pending",0)+d.get("running",0))' \
+            2>/dev/null || echo "$depth")
+      else
+        depth2=$depth
+      fi
+      if (( depth2 > half )); then
+        continue
+      fi
+      # depth has dropped enough; fall through to return 0.
+    fi
+
+    # rule 5: max hold exceeded (only reachable if we held, slept, and
+    # then conditions cleared enough to fall out of the hold branches
+    # without crossing their own MAX_HOLD check; treat as defense in
+    # depth).
+    if (( elapsed >= max_hold )); then
+      echo "guard: held ${elapsed}s >= MAX_HOLD (${max_hold}); stopping" >&2
+      echo 0 > .state 2>/dev/null || true
+      return 1
+    fi
+
+    # All clear.
+    return 0
+  done
+}
 
 show_help()
 {
@@ -569,6 +736,8 @@ cmd_pedmon()
 
       while [[ $(cat .state) -ne 0 ]]
       do
+        guard_acquisition || break
+
         local tmp=$(mktemp -p tmp -d)
 
         python "${SLACUBE_QC_SCRIPTS}/pedestal_qc.py" \
@@ -639,10 +808,10 @@ cmd_run()
           --no_refinement --no_log_simple \
           && mv $tmp/*.h5 "$SLACUBE_DROPBOX" \
           && rmdir $tmp
-
-        local -i n=0
         while [[ $n -lt $selftrig_repeat && $(cat .state) -ne 0 ]]
         do
+          guard_acquisition || break
+
           local tmp=$(mktemp -p tmp -d)
 
           python "${SLACUBE_QC_SCRIPTS}/selftrigger_qc.py" \
@@ -651,8 +820,8 @@ cmd_run()
             --config_name $(read_rc CFG_DIR)  \
             --outdir $tmp --runtime $selftrig_runtime
 
-					nq slacube-convert-and-move $tmp
-          n=$((n+1)) 
+          for f in "$tmp"/raw*.h5; do slacube-convertd submit "$f"; done
+          n=$((n+1))
         done
       done
       ;;

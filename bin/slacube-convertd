@@ -123,15 +123,14 @@ def classify_basename(basename):
     """Map a raw basename to the converted-file prefix.
 
     Returns the destination prefix (e.g. "selftrigger_") or None if the
-    basename cannot be classified. Convention mirrors slacube-convert-and-move:
-    `raw_*` -> `selftrigger_*` (the prefix is replaced, the tail after
-    the prefix is preserved) and `pedestal_*` -> `pedestal_*` (an
-    IDENTITY mapping: the prefix is preserved, the tail is preserved,
-    so the input and output basenames are identical). The pedestal_
-    identity mapping is intentional -- pedestal jobs share the same
-    spool as selftrigger jobs, and the converter is expected to
-    recognize `pedestal_*` inputs and emit a `pedestal_*` output
-    without renaming. Anything else returns None.
+    basename cannot be classified. Convention: `raw_*` -> `selftrigger_*`
+    (the prefix is replaced, the tail after the prefix is preserved) and
+    `pedestal_*` -> `pedestal_*` (an IDENTITY mapping: the prefix is
+    preserved, the tail is preserved, so the input and output basenames
+    are identical). The pedestal_ identity mapping is intentional --
+    pedestal jobs share the same spool as selftrigger jobs, and the
+    converter is expected to recognize `pedestal_*` inputs and emit a
+    `pedestal_*` output without renaming. Anything else returns None.
     """
     if basename.startswith("raw_"):
         return "selftrigger_"
