@@ -5,10 +5,14 @@
 # (or merge the commented line below into your existing `crontab -e`).
 #
 # Environment overrides (all optional):
-#   SLACUBE_SYNC_SOURCE    rsync source. Default `slacube-daq-pull:/data/slacube/pool/`
+#   SLACUBE_SYNC_SOURCE    rsync source. Default `slacube-daq-pull:/`
 #                          (the restricted rrsync alias already configured this
-#                          round). Do NOT replace with a raw hostname -- the
-#                          restricted credential is reached only via that alias.
+#                          round -- it chdir()s into /data/slacube/pool and
+#                          concatenates any client path onto it verbatim, so
+#                          only the bare root survives; do NOT restate the
+#                          absolute path here). Do NOT replace with a raw
+#                          hostname -- the restricted credential is reached
+#                          only via that alias.
 #   SLACUBE_SYNC_DEST      rsync destination. Default
 #                          `/sdf/data/neutrino/slacube/pool`.
 #

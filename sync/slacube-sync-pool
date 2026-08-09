@@ -23,12 +23,20 @@
 #      use per this round's D4 credential decision).
 #
 # Configuration:
-#   $SLACUBE_SYNC_SOURCE    rsync source. Default
-#                           `slacube-daq-pull:/data/slacube/pool/`.
+#   $SLACUBE_SYNC_SOURCE    rsync source. Default `slacube-daq-pull:/`.
 #                           The restricted rrsync credential provisioned
 #                           this round is reached only via that alias --
 #                           do not replace the default with a raw
-#                           hostname.
+#                           hostname. The alias is provisioned as
+#                           `command="rrsync -ro /data/slacube/pool"`,
+#                           which chdir()s into that directory and then
+#                           concatenates the client-supplied path onto
+#                           it verbatim -- restating the absolute path
+#                           here (as an earlier default did) resolves
+#                           remotely to a doubled, nonexistent
+#                           directory and every pull fails (rsync exit
+#                           23). Only the bare restricted root (`/`)
+#                           survives that concatenation.
 #   $SLACUBE_SYNC_DEST      rsync destination directory. Default
 #                           `/sdf/data/neutrino/slacube/pool`. The
 #                           trailing slash semantics of rsync are
@@ -55,7 +63,7 @@
 set -uo pipefail
 
 PROGRAM="${0##*/}"
-DEFAULT_SOURCE="slacube-daq-pull:/data/slacube/pool/"
+DEFAULT_SOURCE="slacube-daq-pull:/"
 DEFAULT_DEST="/sdf/data/neutrino/slacube/pool"
 
 # Long-only flags (no getopts -- this script has at most two flags and

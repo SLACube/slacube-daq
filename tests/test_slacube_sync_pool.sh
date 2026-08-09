@@ -363,6 +363,41 @@ check $([[ "$out" != *"WARNING"* ]] && echo 1 || echo 0) "G10: routine pull stay
 rm -rf "$ROOT"
 
 
+# ------------------------------------------ regression: DEFAULT_SOURCE path-doubling (rrsync)
+echo
+echo "[regression: DEFAULT_SOURCE is the bare restricted root, not a restated path (rrsync path-doubling bug)]"
+# SLACUBE_SYNC_SOURCE is deliberately left UNSET here so the real
+# DEFAULT_SOURCE literal is exercised, not a test override. Found live
+# against nu-daq01-ir2 (Round 3 D2): the `slacube-daq-pull` credential
+# is `command="rrsync -ro /data/slacube/pool"`, which chdir()s into
+# that directory and concatenates the client-supplied path onto it
+# verbatim (no normalization). A DEFAULT_SOURCE that restates the
+# absolute path (`slacube-daq-pull:/data/slacube/pool/`) therefore
+# resolved remotely to the doubled, nonexistent
+# `/data/slacube/pool//data/slacube/pool` and every pull failed (rsync
+# exit 23, verified with the live credential). Only the bare root
+# (`slacube-daq-pull:/`) survives that concatenation. This test never
+# calls real ssh/rsync -- it records the argv the script would have
+# run and pins the SOURCE token.
+fakebin=$(mktemp -d)
+argv_log=$(mktemp)
+cat > "$fakebin/rsync" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$argv_log"
+exit 0
+EOF
+chmod +x "$fakebin/rsync"
+dest_root=$(mktemp -d)
+out=$(PATH="$fakebin:$PATH" SLACUBE_SYNC_DEST="$dest_root" slacube-sync-pool 2>&1)
+rc=$?
+check $([[ $rc -eq 0 ]] && echo 1 || echo 0) "regression: default-source pull exits 0 under the recording stub"
+pull_line=$(sed -n '1p' "$argv_log")
+check $([[ "$pull_line" == *" slacube-daq-pull:/ "* ]] && echo 1 || echo 0) "regression: DEFAULT_SOURCE resolves to the bare restricted root (slacube-daq-pull:/)"
+check $([[ "$pull_line" != *"slacube-daq-pull:/data/slacube/pool"* ]] && echo 1 || echo 0) "regression: DEFAULT_SOURCE does not restate /data/slacube/pool (rrsync path-doubling bug)"
+rm -rf "$fakebin" "$dest_root"
+rm -f "$argv_log"
+
+
 # ---------------------------------------------------------- result
 echo
 echo "============================================================"
