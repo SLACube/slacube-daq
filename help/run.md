@@ -50,10 +50,10 @@ ENVIRONMENT
 :   Destination for pedestal output. Self-triggered raw output is submitted to `$SLACUBE_SPOOL` and converted/moved into `$SLACUBE_DROPBOX` by `slacube-convertd`. See `slacube help`.
 
 `$SLACUBE_SPOOL`
-::   Spool directory used by `slacube-convertd` to convert self-triggered data. See `slacube queue help`.
+:   Spool directory used by `slacube-convertd` to convert self-triggered data. See `slacube queue help`.
 
 `$SLACUBE_MAX_CONSECUTIVE_FAIL`, `$SLACUBE_MAX_BACKLOG`, `$SLACUBE_MIN_FREE`, `$SLACUBE_MIN_FREE_DROPBOX`, `$SLACUBE_RESUME_FREE`, `$SLACUBE_RESUME_FREE_DROPBOX`, `$SLACUBE_GUARD_POLL`, `$SLACUBE_MAX_HOLD`
-::   Guardrail knobs (defaults live in `guard_acquisition` in `bin/slacube`): the self-trigger loop holds when the spool backlog exceeds `MAX_BACKLOG` or either filesystem falls below its `MIN_FREE*`, prints one line per `GUARD_POLL` seconds, and resumes once the backlog and free-space thresholds recover. Consecutive convertd failures at or above `MAX_CONSECUTIVE_FAIL`, a failed `df`, or holding longer than `MAX_HOLD` set `.state=0` and exit the loop cleanly. See `slacube help`.
+:   Guardrail knobs (defaults live in `guard_acquisition` in `bin/slacube`): the self-trigger loop holds when the spool backlog exceeds `MAX_BACKLOG` or either filesystem falls below its `MIN_FREE*`, prints one line per `GUARD_POLL` seconds, and resumes once the backlog and free-space thresholds recover. Consecutive convertd failures at or above `MAX_CONSECUTIVE_FAIL`, a failed `df`, or holding longer than `MAX_HOLD` set `.state=0` and exit the loop cleanly. See `slacube help`.
 
 SEE ALSO
 ========

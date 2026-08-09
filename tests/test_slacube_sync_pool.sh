@@ -250,6 +250,53 @@ echo "$out" | grep -q 'selftrigger_2026_08_01_10_00_00' && check 1 "verbose: per
 # And the one-line summary is still present.
 echo "$out" | grep -E '^slacube-sync-pool: pulled=' | grep -q 'pulled=4' && check 1 "verbose: summary still present" || check 0 "verbose: summary still present"
 rm -rf "$ROOT"
+ 
+ # ---------------------------------------------------------- restricted remote source
+echo
+echo "[restricted remote source: report uses rsync only]"
+eval "$(make_fixture)"
+mkdir -p "$SRC/pool/selftrigger/2026/2026-08-01"
+echo remote > "$SRC/pool/selftrigger/2026/2026-08-01/remote.h5"
+fakebin=$(mktemp -d)
+cat > "$fakebin/rsync" <<'RSYNC'
+#!/usr/bin/env bash
+set -u
+if [[ "$*" == *--dry-run* ]]; then
+  exit 0
+fi
+src="${@: -2:1}"; dst="${@: -1}"
+src=${src#*:}
+mkdir -p "$dst"
+cp -a "$src"/. "$dst"/
+printf '>f+++++++++ pool/selftrigger/2026/2026-08-01/remote.h5\n'
+RSYNC
+ssh_marker="$ROOT/ssh-called"
+cat > "$fakebin/ssh" <<'SSH'
+#!/usr/bin/env bash
+touch "$SSH_MARKER"
+exit 77
+SSH
+chmod +x "$fakebin/rsync" "$fakebin/ssh"
+out=$(SSH_MARKER="$ssh_marker" PATH="$fakebin:$PATH" SLACUBE_SYNC_SOURCE="alias:$SRC/" SLACUBE_SYNC_DEST="$DST" slacube-sync-pool 2>&1)
+rc=$?
+check $([[ $rc -eq 0 ]] && echo 1 || echo 0) "restricted remote source: rsync-only report succeeds"
+check $([[ ! -e "$ssh_marker" ]] && echo 1 || echo 0) "restricted remote source: no SSH enumeration"
+rm -rf "$fakebin" "$ROOT"
+
+echo
+echo "[enumeration failure: fatal error]"
+eval "$(make_fixture)"
+fakebin=$(mktemp -d)
+cat > "$fakebin/rsync" <<'RSYNC'
+#!/usr/bin/env bash
+exit 1
+RSYNC
+chmod +x "$fakebin/rsync"
+out=$(PATH="$fakebin:$PATH" SLACUBE_SYNC_SOURCE="alias:/missing/" SLACUBE_SYNC_DEST="$DST" slacube-sync-pool 2>&1)
+rc=$?
+check $([[ $rc -eq 1 ]] && echo 1 || echo 0) "connection failure: fatal exit"
+check $([[ "$out" == *"pull failed"* ]] && echo 1 || echo 0) "connection failure: clear fatal message"
+rm -rf "$fakebin" "$ROOT"
 
 
 # ---------------------------------------------------------- result

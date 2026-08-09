@@ -32,14 +32,14 @@ refused via `flock` on `$SLACUBE_SPOOL/.daemon.lock`.
 COMMAND
 =======
 submit _raw-file_
-::   Submit a raw `.h5` to `incoming/`. No-op (exit 0) if a job with the same
+:   Submit a raw `.h5` to `incoming/`. No-op (exit 0) if a job with the same
     basename already exists in any of the four spool subdirectories. A
     basename that does not match a known raw convention (e.g. `raw_*.h5`
     or `pedestal_*.h5`) is recorded in `failed/` with
     `last_error="unclassifiable"` immediately (no conversion attempted).
 
 serve
-::   Run the daemon loop (for systemd). Polls `incoming/` every
+:   Run the daemon loop (for systemd). Polls `incoming/` every
     `$SLACUBE_CONVERT_POLL` seconds (default 5), claims up to
     `$SLACUBE_CONVERT_WORKERS` (default 2) jobs in parallel via `os.rename`,
     runs `slacube-convert-raw.py` on each with a per-job timeout of
@@ -50,7 +50,7 @@ serve
     `last_error="interrupted"` on next start.
 
 status
-::   Print one summary line `pending=N running=N failed=N done=N
+:   Print one summary line `pending=N running=N failed=N done=N
     consecutive_fail=N` to stdout, then exit:
 
     | exit | meaning                                                           |
@@ -64,36 +64,36 @@ status
     Task 3's `slacube-fsck` both consume this).
 
 retry _job_
-::   Move `failed/<job>.json` back to `incoming/<job>.json` and reset
+:   Move `failed/<job>.json` back to `incoming/<job>.json` and reset
     `attempts` to 0 and `last_error` to null. Use after fixing the
     underlying cause (free space, bad channel file, etc).
 
 ack _job_
-::   Move `failed/<job>.json` to `done/<job>.json` with `outcome="acked"`.
+:   Move `failed/<job>.json` to `done/<job>.json` with `outcome="acked"`.
     Use to retire a job without retrying (e.g. raw is known-corrupt).
 
 drain
-::   Block (polling, no daemon required) until `incoming/` and `running/`
+:   Block (polling, no daemon required) until `incoming/` and `running/`
     are both empty, then exit 0. Used for tests and for clean shutdown
     before an upgrade.
 
 install
-::   Write `~/.config/systemd/user/slacube-convert.service` and run
+:   Write `~/.config/systemd/user/slacube-convert.service` and run
     `systemctl --user daemon-reload && systemctl --user enable --now
     slacube-convert.service`. The unit sources `$SLACUBE_SITE_FILE`
     (default `~/.slacube-site.sh`) before starting `slacube-convertd serve`.
 
 uninstall
-::   Run `systemctl --user disable --now slacube-convert.service` and
+:   Run `systemctl --user disable --now slacube-convert.service` and
     remove the unit file.
 
 logs
-::   Tail the systemd user journal for `slacube-convert.service` via
+:   Tail the systemd user journal for `slacube-convert.service` via
     `journalctl --user -u slacube-convert.service`. Implemented in
     `slacube` itself (the daemon script has no `logs` subcommand).
 
 help
-::   Show this text.
+:   Show this text.
 
 EXAMPLES
 ========
@@ -125,41 +125,41 @@ Retry a failed job
 ENVIRONMENT
 ===========
 `$SLACUBE_SPOOL`
-::   Root of the spool directory (containing `incoming/`, `running/`,
+:   Root of the spool directory (containing `incoming/`, `running/`,
     `failed/`, `done/`).
 
 `$SLACUBE_DROPBOX`
-::   Destination for converted files. Atomically published as
+:   Destination for converted files. Atomically published as
     `<basename>` after staging via `.<basename>.part`.
 
 `$SLACUBE_RAW_CACHE`
-::   Root of the raw-file archive. Each raw is renamed into
+:   Root of the raw-file archive. Each raw is renamed into
     `<year>/<date>/<basename>` based on the timestamp embedded in the raw
     filename.
 
 `$SLACUBE_WORKDIR`
-::   Scratch directory where the daemon writes the `.part` intermediate
+:   Scratch directory where the daemon writes the `.part` intermediate
     before publishing to the dropbox. Defaults to the parent of
     `$SLACUBE_SPOOL` if unset.
 
 `$SLACUBE_CONVERT_POLL`
-::   Poll interval (seconds) for `serve`. Default `5`.
+:   Poll interval (seconds) for `serve`. Default `5`.
 
 `$SLACUBE_CONVERT_WORKERS`
-::   Number of worker threads. Default `2`.
+:   Number of worker threads. Default `2`.
 
 `$SLACUBE_CONVERT_TIMEOUT`
-::   Per-job converter timeout (seconds). Default `1800`.
+:   Per-job converter timeout (seconds). Default `1800`.
 
 `$SLACUBE_CONVERT_ATTEMPTS`
-::   Maximum attempts per job before quarantine. Default `3`.
+:   Maximum attempts per job before quarantine. Default `3`.
 
 `$SLACUBE_MAX_CONSECUTIVE_FAIL`
-::   Threshold used by `status` to classify a quarantine as systematic
+:   Threshold used by `status` to classify a quarantine as systematic
     (exit 1) vs. isolated (exit 2). Default `3`.
 
 `$SLACUBE_SITE_FILE`
-::   Path sourced by the systemd unit before `slacube-convertd serve`.
+:   Path sourced by the systemd unit before `slacube-convertd serve`.
     Default `~/.slacube-site.sh`.
 
 NOTES

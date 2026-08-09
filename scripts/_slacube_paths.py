@@ -65,6 +65,8 @@ RAW_TO_CONVERTED_PREFIX = (
 LEGACY_POOL_RAW_DIRNAME = "raw"
 
 
+# Keep these standalone-compatible semantics aligned with
+# bin/slacube-convertd; tests cross-check their shared fixtures.
 def classify_basename(basename):
     """Return the type name (``selftrigger``/``pedestal``/``exttrig``)
     embedded in a converted-file basename, or None if the basename

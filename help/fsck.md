@@ -38,22 +38,22 @@ steady state, not a finding; never enumerated).
 COMMAND
 =======
 help
-::::   Show this text.
+:   Show this text.
 
 ENVIRONMENT
 ===========
 `$SLACUBE_DROPBOX`
-::::   Required. Directory holding converted `*.h5` files.
+:   Required. Directory holding converted `*.h5` files.
 
 `$SLACUBE_RAW_CACHE`
-::::   Directory holding the raw file archive. If set and unreadable,
+:   Directory holding the raw file archive. If set and unreadable,
       fsck exits 1.
 
 `$SLACUBE_SPOOL`
-::::   Root of the conversion spool. If set and unreadable, fsck exits 1.
+:   Root of the conversion spool. If set and unreadable, fsck exits 1.
 
 `dirname($SLACUBE_DROPBOX)/pool/`
-::::   Long-term pool. If it does not exist or is unreadable, fsck
+:   Long-term pool. If it does not exist or is unreadable, fsck
       exits 1.
 
 NOTES

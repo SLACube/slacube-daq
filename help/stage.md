@@ -32,10 +32,10 @@ hierarchy under `dirname($SLACUBE_DROPBOX)/pool/`.
 COMMAND
 =======
 --once
-:::   (default behaviour) stage every classifiable file once and exit.
+:   (default behaviour) stage every classifiable file once and exit.
 
 help
-:::   Show this text.
+:   Show this text.
 
 EXAMPLES
 ========
@@ -47,7 +47,7 @@ Run once after the conversion daemon finishes a batch
 ENVIRONMENT
 ===========
 `$SLACUBE_DROPBOX`
-:::   Directory holding converted `*.h5` files awaiting staging. Required.
+:   Directory holding converted `*.h5` files awaiting staging. Required.
 
 NOTES
 =====

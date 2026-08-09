@@ -26,30 +26,30 @@ data that may still be present.
 COMMAND
 =======
 help
-::::   Show this text.
+:   Show this text.
 
 ENVIRONMENT
 ===========
 `$SLACUBE_RAW_CACHE`
-::::   Required. The raw cache to evict from. Missing directory is a
+:   Required. The raw cache to evict from. Missing directory is a
       fatal error.
 
 `$SLACUBE_DROPBOX`
-::::   Required. The dropbox whose contents count as converted
+:   Required. The dropbox whose contents count as converted
       twins; `dirname($SLACUBE_DROPBOX)/pool/` is the other twin
       source.
 
 `$SLACUBE_RAW_CACHE_LOW`
-::::   Free-space low watermark in bytes (default `500 GiB`).
+:   Free-space low watermark in bytes (default `500 GiB`).
       Absolute bytes; never percentages (D3, D6).
 
 `$SLACUBE_RAW_CACHE_HIGH`
-::::   Free-space high watermark in bytes (default `750 GiB`).
+:   Free-space high watermark in bytes (default `750 GiB`).
       Reaping stops once free space reaches this value. Must
       exceed `LOW`; if not, `HIGH` is clamped to `LOW + 250 GiB`.
 
 `$SLACUBE_REAP_POLL`
-::::   Poll interval (seconds) between `df` re-checks once free
+:   Poll interval (seconds) between `df` re-checks once free
       space is below `LOW`. Default `5`.
 
 NOTES

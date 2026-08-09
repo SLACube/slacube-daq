@@ -38,6 +38,10 @@ _loader = _importlib_machinery.SourceFileLoader("slacube_convertd", _CONVERTD_PA
 _spec = _importlib_util.spec_from_loader("slacube_convertd", _loader)
 convertd = _importlib_util.module_from_spec(_spec)
 _loader.exec_module(convertd)
+SCRIPTS_DIR = os.path.normpath(os.path.join(HERE, "..", "scripts"))
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
+import _slacube_paths as shared_paths
 
 
 # ---------------------------------------------------------------- helpers
@@ -213,6 +217,31 @@ check(
 
 yr, dt = convertd.parse_year_date("raw_2026_02_21_21_52_18.h5")
 check(yr == "2026" and dt == "2026-02-21", "parse year/date from raw_2026_02_21_21_52_18.h5")
+
+print("\n[classification/date parity with shared path helpers]")
+fixtures = (
+    "raw_2026_02_21_21_52_18.h5",
+    "pedestal_2026_02_21_21_52_18.h5",
+    "archive_raw_2026_02_21_21_52_18.h5",
+    "raw_bad_stamp.h5",
+)
+for basename in fixtures:
+    converted = shared_paths.raw_basename_to_converted(basename)
+    expected_prefix = None
+    if converted is not None:
+        expected_prefix = converted[:-len(basename.split("_", 1)[1])]
+    check(convertd.classify_basename(basename) == expected_prefix,
+          "classification agrees for %s" % basename)
+    try:
+        convertd_result = convertd.parse_year_date(basename)
+    except ValueError:
+        convertd_result = ValueError
+    try:
+        shared_result = shared_paths.parse_year_date(basename)
+    except ValueError:
+        shared_result = ValueError
+    check(convertd_result == shared_result,
+          "date parsing agrees for %s" % basename)
 
 # ---------------------------------------------------------- submit / dedup
 print("\n[submit & dedup]")

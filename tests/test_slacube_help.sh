@@ -65,6 +65,12 @@ check $([[ $rc -eq 0 ]] && echo 1 || echo 0) "stage help: exit 0"
 echo "$out" | grep -q 'slacube stage' && check 1 "stage help: identifies command" || check 0 "stage help: identifies command"
 
 
+# ---------------------------------------------------------- marker consistency
+echo
+echo "[help definition-list markers]"
+bad_markers=$(grep -EH '^:{2,}[[:space:]]' "$REPO_ROOT"/help/*.md || true)
+check $([[ -z "$bad_markers" ]] && echo 1 || echo 0) "all help files use the pre-existing single-colon marker"
+
 # ---------------------------------------------------------- result
 echo
 echo "============================================================"

@@ -119,6 +119,8 @@ def job_record_path(spool_root, sub, name):
 
 
 # ---------------------------------------------------------------- classification
+# Keep this standalone implementation behaviorally aligned with
+# scripts/_slacube_paths.py; tests cross-check their shared fixtures.
 def classify_basename(basename):
     """Map a raw basename to the converted-file prefix.
 
@@ -145,16 +147,15 @@ def parse_year_date(basename):
     Returns (year, date) as strings. Raises ValueError on no match.
     """
     base = os.path.basename(basename)
-    parts = base.replace(".h5", "").split("_")
-    # Need at least year _ month _ day
-    if len(parts) < 4:
-        raise ValueError("basename %r does not carry a YYYY_MM_DD_* stamp" % base)
-    year, month, day = parts[1], parts[2], parts[3]
-    if not (len(year) == 4 and year.isdigit()
-            and len(month) == 2 and month.isdigit()
-            and len(day) == 2 and day.isdigit()):
-        raise ValueError("basename %r does not carry a YYYY_MM_DD_* stamp" % base)
-    return year, "%s-%s-%s" % (year, month, day)
+    stripped = base[:-len(".h5")] if base.endswith(".h5") else base
+    parts = stripped.split("_")
+    for i in range(len(parts) - 2):
+        year, month, day = parts[i], parts[i + 1], parts[i + 2]
+        if (len(year) == 4 and year.isdigit()
+                and len(month) == 2 and month.isdigit()
+                and len(day) == 2 and day.isdigit()):
+            return year, "%s-%s-%s" % (year, month, day)
+    raise ValueError("basename %r does not carry a YYYY_MM_DD_* stamp" % base)
 
 
 # ---------------------------------------------------------------- submit
@@ -605,8 +606,8 @@ def _now_in_window(not_before):
 
 
 def _dispatch_pass(spool_root, dropbox_root, raw_cache_root, workdir_root,
-                   workers, sem, converter, timeout, attempts_max):
-    """Claim and dispatch up to `workers` jobs concurrently.
+                   sem, converter, timeout, attempts_max):
+    """Claim and dispatch available jobs concurrently.
 
     Each job is checked for `not_before`; jobs whose backoff window has
     not yet elapsed are skipped (left in incoming/ for the next pass).
@@ -659,7 +660,7 @@ def _serve_loop(spool_root, dropbox_root, raw_cache_root, workdir_root,
 
     if once:
         _dispatch_pass(spool_root, dropbox_root, raw_cache_root, workdir_root,
-                       workers, sem, converter, timeout, attempts_max)
+                       sem, converter, timeout, attempts_max)
         return
 
     # Long-running loop
@@ -673,7 +674,7 @@ def _serve_loop(spool_root, dropbox_root, raw_cache_root, workdir_root,
 
     while not stop.is_set():
         _dispatch_pass(spool_root, dropbox_root, raw_cache_root, workdir_root,
-                       workers, sem, converter, timeout, attempts_max)
+                       sem, converter, timeout, attempts_max)
         if stop.wait(timeout=poll_interval):
             return
 

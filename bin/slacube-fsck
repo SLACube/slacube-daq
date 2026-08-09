@@ -42,6 +42,7 @@ if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
 from _slacube_paths import (  # noqa: E402
+    RAW_TO_CONVERTED_PREFIX,
     has_converted_twin,
     pool_root_for,
     raw_basename_to_converted,
@@ -306,9 +307,8 @@ def _section_f_free_space(raw_cache, dropbox, spool):
     # costly to enumerate (one converted -> many possible raws), so we
     # compute the inverted mapping once.
     inverted = {
-        "selftrigger_": "raw_",
-        "pedestal_": "pedestal_",
-        "exttrig_": "exttrig_",
+        converted_prefix: raw_prefix
+        for raw_prefix, converted_prefix in RAW_TO_CONVERTED_PREFIX
     }
     for converted in sorted(dropbox_set | pool_set):
         if not converted.endswith(".h5"):

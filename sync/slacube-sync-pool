@@ -80,40 +80,18 @@ log() {
 
 
 
-# Enumerate regular files under the source tree, excluding any
-# directory literally named `raw` (D7). For ssh-remote sources this
-# runs find over ssh; for local-path sources it runs find locally.
-# Outputs absolute-or-source-relative paths (one per line). Strips
-# the source root prefix and yields paths relative to the source
-# root, mirroring the relative paths rsync shows in itemize output.
-enumerate_source_files() {
-  local prefix
-  if [[ "$SOURCE" == *:* ]]; then
-    local ssh_target="${SOURCE%%:*}"
-    local ssh_root="${SOURCE#*:}"
-    ssh_root="${ssh_root%/}"
-    prefix="$ssh_root/"
-    # The read-only rrsync credential cannot answer `find` in any
-    # structured way; the find call here uses the operator's
-    # unrestricted ssh path (same caveat as --delete-source). For
-    # BATCHMODE-d test runs the connection may fail, in which case
-    # we treat it as a fatal error (we genuinely need this list).
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-      "$ssh_target" \
-      "find '$ssh_root' -type f -not -path '*/raw/*' -not -path '*/raw'" 2>/dev/null \
-      | while IFS= read -r p; do
-        [[ "$p" == "$prefix"* ]] && p="${p#$prefix}"
-        printf '%s\n' "$p"
-      done
-  else
-    local local_root="${SOURCE%/}"
-    prefix="$local_root/"
-    find "$local_root" -type f -not -path '*/raw/*' -not -path '*/raw' \
-      | while IFS= read -r p; do
-        [[ "$p" == "$prefix"* ]] && p="${p#$prefix}"
-        printf '%s\n' "$p"
-      done
-  fi
+# Enumerate regular files under the destination tree, excluding any
+# directory literally named `raw`. The pull and checksum verify passes
+# have already established that this local mirror represents the source
+# namespace, so report building needs no additional source connection.
+enumerate_mirrored_files() {
+  local dest_root="${DEST%/}"
+  local prefix="$dest_root/"
+  local p
+  while IFS= read -r p; do
+    [[ "$p" == "$prefix"* ]] && p="${p#$prefix}"
+    printf '%s\n' "$p"
+  done < <(find "$dest_root" -type f -not -path '*/raw/*' -not -path '*/raw')
 }
 
 # Resolve a source-relative path to its absolute (or ssh-relative)
@@ -139,16 +117,11 @@ DEST="${SLACUBE_SYNC_DEST:-$DEFAULT_DEST}"
 # Normalize SOURCE so it ALWAYS ends in exactly one trailing slash,
 # regardless of how the caller spelled SLACUBE_SYNC_SOURCE. The verify
 # pass's itemize output uses paths relative to SOURCE's contents, and
-# enumerate_source_files emits the same namespace. The two namespaces
-# agree only when SOURCE ends in '/'. If a caller supplies SOURCE
-# without a trailing slash, rsync's itemize output uses paths that
-# include the source directory's basename (e.g. `pool/...` for
-# `src/`, but `src/pool/...` for `src`), so every flagged_set lookup
-# would silently miss and --delete-source would happily delete a
-# flagged-differing file -- the one invariant this script must never
-# break. DEST is normalized for symmetry: it does not change rsync's
-# behavior for an existing destination, but it keeps every callsite
-# consistent and removes the foot-gun of "remember to add the slash".
+# enumerate_mirrored_files emits the same namespace. The two namespaces
+# agree only when SOURCE ends in '/'. Normalizing prevents rsync from
+# including the source directory basename in itemized paths. DEST is
+# normalized for symmetry: it does not change rsync's behavior for an
+# existing destination, but keeps every callsite consistent.
 case "$SOURCE" in
   */) ;;
   *)  SOURCE="$SOURCE/" ;;
@@ -226,17 +199,14 @@ for f in "${flagged_paths[@]}"; do
   flagged_set["$f"]=1
 done
 
-# --- step 3: enumerate eligible source-side files ----------------------
+# --- step 3: enumerate eligible mirrored files --------------------------
 
 # A file is eligible for deletion from the source IF:
-#   * it exists in the source tree (per the source-side walk),
+#   * it exists in the verified destination mirror,
 #   * the verify pass did NOT flag it as differing,
-#   * it is NOT under any path named `raw/` (D7; the walk already
-#     excludes these, but the defensive check is kept here if the
-#     source tree changes shape in a future scheme), and
-#   * it is a regular file (no directories are deleted; tree pruning
-#     is left for an explicit, later decision).
-source_files=$(enumerate_source_files)
+#   * it is NOT under any path named `raw/`, and
+#   * it is a regular file.
+source_files=$(enumerate_mirrored_files)
 would_delete=0
 declare -a would_delete_list=()
 while IFS= read -r rel; do
@@ -251,12 +221,9 @@ while IFS= read -r rel; do
   would_delete_list+=("$rel")
 done <<< "$source_files"
 
-# verified = source files that the verify pass did NOT flag as
-# differing. With the source tree walked as above and the find call
-# excluding raw/, this equals would_delete (D7 cannot violate the
-# equivalence). The separate name is kept because the one-line
-# summary is the contract: callers expect to read it and learn
-# "how many files are verified" vs "how many would have been deleted".
+# verified = mirrored files that the verify pass did NOT flag as
+# differing. The destination walk excludes raw/, so this equals
+# would_delete. The separate name preserves the summary contract.
 verified=$would_delete
 
 if [[ "$VERBOSE" -eq 1 ]]; then
