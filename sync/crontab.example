@@ -1,0 +1,45 @@
+# Example crontab entry for `slacube-sync-pool` on sdfcron001.
+#
+# Install on sdfcron001 with:
+#   crontab crontab.example
+# (or merge the commented line below into your existing `crontab -e`).
+#
+# Environment overrides (all optional):
+#   SLACUBE_SYNC_SOURCE    rsync source. Default `slacube-daq-pull:/data/slacube/pool/`
+#                          (the restricted rrsync alias already configured this
+#                          round). Do NOT replace with a raw hostname -- the
+#                          restricted credential is reached only via that alias.
+#   SLACUBE_SYNC_DEST      rsync destination. Default
+#                          `/sdf/data/neutrino/slacube/pool`.
+#
+# Cron mails the user on non-empty stdout. The script's normal-run output
+# is a single summary line plus one line per file the script *would*
+# delete from source (because --delete-source is OFF by default; see
+# below). If you do not want this in your mailbox, redirect both stdout
+# and stderr to a log file (the example below does that).
+#
+# --------------------------------------------------------------------------
+# --delete-source caveat (D4)
+#
+# The default invocation is dry-run-by-default: it pulls, verifies, and
+# PRINTS which files it would delete from the source, but does NOT touch
+# the source. The DAQ host's `slacube-daq-pull` SSH alias is an
+# `rrsync -ro` credential -- read-only -- which this script uses for the
+# pull + verify legs but which CANNOT delete source-side files.
+#
+# Wiring source-side deletion requires the unrestricted `slac-ir2` SSH
+# key (or a policy change that grants the rrsync credential delete
+# rights). Per this round's D4 credential decision, the unrestricted
+# key is deliberately NOT the one this automation should use. The
+# default entry below therefore omits `--delete-source`. To enable
+# deletion once the credential policy is settled, change the line to:
+#
+#   0 3 * * * /path/to/slacube-sync-pool --delete-source >> ~/slacube-sync-pool.log 2>&1
+#
+# and accept that the operator's unrestricted ssh key will be used to
+# delete source-side files.
+# --------------------------------------------------------------------------
+
+# Daily at 03:00 sdfcron001 local time. Pull + verify + dry-run
+# summary. Source-side deletion is intentionally NOT enabled.
+0 3 * * * /path/to/slacube-sync-pool >> ~/slacube-sync-pool.log 2>&1

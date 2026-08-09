@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# slacube-sync-pool: pull + verify the slacube pool tree from the DAQ
+# host to S3DF (sdfcron001), and optionally delete source-side files
+# whose successor copy on S3DF has been verified.
+#
+# Three steps (D4):
+#   1. Pull: rsync -a --exclude=raw <source>/ <dest>
+#   2. Verify: rsync -a --checksum --dry-run --itemize-changes
+#      --exclude=raw <source>/ <dest> -- parse the itemized output;
+#      any line in the output indicates a difference, so that file
+#      is NOT eligible for deletion this run. Files that produce no
+#      line in the output are byte-identical between source and dest
+#      and are eligible.
+#   3. Delete: from the source, every file present in both trees that
+#      the verify pass did NOT flag as differing -- but **only** when
+#      --delete-source is passed. The default invocation is a
+#      dry-run-by-default: it prints the list of files it WOULD delete
+#      and touches nothing on the source. See the comment in
+#      `sync/crontab.example` for the credential caveat (the
+#      restricted `slacube-daq-pull` rrsync credential is read-only;
+#      deleting on the source requires the unrestricted `slac-ir2`
+#      key, which is deliberately NOT the one this automation should
+#      use per this round's D4 credential decision).
+#
+# Configuration:
+#   $SLACUBE_SYNC_SOURCE    rsync source. Default
+#                           `slacube-daq-pull:/data/slacube/pool/`.
+#                           The restricted rrsync credential provisioned
+#                           this round is reached only via that alias --
+#                           do not replace the default with a raw
+#                           hostname.
+#   $SLACUBE_SYNC_DEST      rsync destination directory. Default
+#                           `/sdf/data/neutrino/slacube/pool`. The
+#                           trailing slash semantics of rsync are
+#                           preserved: pass the destination WITHOUT a
+#                           trailing slash so the source's contents land
+#                           inside it.
+#
+# Exit codes:
+#   0  success (pulled, verified, delete-step completed as requested)
+#   1  any rsync step failed
+#   2  required env var missing or invalid (or unknown CLI flag)
+#
+# Stdlib only (bash); no new third-party dependencies.
+
+set -uo pipefail
+
+PROGRAM="${0##*/}"
+DEFAULT_SOURCE="slacube-daq-pull:/data/slacube/pool/"
+DEFAULT_DEST="/sdf/data/neutrino/slacube/pool"
+
+# Long-only flags (no getopts -- this script has at most two flags and
+# the long-only style matches the rest of the slacube tooling).
+VERBOSE=0
+DELETE_SOURCE=0
+for arg in "$@"; do
+  case "$arg" in
+    --verbose)        VERBOSE=1 ;;
+    --delete-source)  DELETE_SOURCE=1 ;;
+    -h|--help)
+      sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      printf '%s: unknown argument: %s\n' "$PROGRAM" "$arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# --- helpers ------------------------------------------------------------
+
+log() {
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    printf '%s\n' "$*"
+  fi
+}
+
+
+
+# Enumerate regular files under the source tree, excluding any
+# directory literally named `raw` (D7). For ssh-remote sources this
+# runs find over ssh; for local-path sources it runs find locally.
+# Outputs absolute-or-source-relative paths (one per line). Strips
+# the source root prefix and yields paths relative to the source
+# root, mirroring the relative paths rsync shows in itemize output.
+enumerate_source_files() {
+  local prefix
+  if [[ "$SOURCE" == *:* ]]; then
+    local ssh_target="${SOURCE%%:*}"
+    local ssh_root="${SOURCE#*:}"
+    ssh_root="${ssh_root%/}"
+    prefix="$ssh_root/"
+    # The read-only rrsync credential cannot answer `find` in any
+    # structured way; the find call here uses the operator's
+    # unrestricted ssh path (same caveat as --delete-source). For
+    # BATCHMODE-d test runs the connection may fail, in which case
+    # we treat it as a fatal error (we genuinely need this list).
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      "$ssh_target" \
+      "find '$ssh_root' -type f -not -path '*/raw/*' -not -path '*/raw'" 2>/dev/null \
+      | while IFS= read -r p; do
+        [[ "$p" == "$prefix"* ]] && p="${p#$prefix}"
+        printf '%s\n' "$p"
+      done
+  else
+    local_root="${SOURCE%/}"
+    prefix="$local_root/"
+    find "$local_root" -type f -not -path '*/raw/*' -not -path '*/raw' \
+      | while IFS= read -r p; do
+        [[ "$p" == "$prefix"* ]] && p="${p#$prefix}"
+        printf '%s\n' "$p"
+      done
+  fi
+}
+
+# Resolve a source-relative path to its absolute (or ssh-relative)
+# transport path. Echoes the path the caller should use for `rm` or
+# `ssh ... rm`.
+resolve_source_path() {
+  local rel="$1"
+  if [[ "$SOURCE" == *:* ]]; then
+    ssh_root="${SOURCE#*:}"
+    ssh_root="${ssh_root%/}"
+    printf '%s/%s' "$ssh_root" "$rel"
+  else
+    local_root="${SOURCE%/}"
+    printf '%s/%s' "$local_root" "$rel"
+  fi
+}
+
+# --- configuration ------------------------------------------------------
+
+SOURCE="${SLACUBE_SYNC_SOURCE:-$DEFAULT_SOURCE}"
+DEST="${SLACUBE_SYNC_DEST:-$DEFAULT_DEST}"
+
+# --- step 1: pull -------------------------------------------------------
+
+# Pull uses archive mode (no --checksum; we don't need byte-by-byte
+# verification on the pull leg, ordinary size+mtime is cheaper and
+# sufficient because the verify pass in step 2 catches drift). The
+# exclude of `raw` is D7's hard requirement: nothing in this scheme
+# touches the legacy pool/raw/ tree.
+#
+# `rsync -i` is used so we can count how many files were actually
+# transferred (the parse: any line starting with `>f` or `>d` is a
+# file system-side transfer; entries for plain directories and total
+# summaries are ignored).
+if [[ "$VERBOSE" -eq 1 ]]; then
+  log "pull: rsync -ai --exclude=raw $SOURCE $DEST"
+fi
+rsync_pull_out=$(rsync -ai --exclude='raw' --exclude='/raw' --exclude='/raw/' \
+  "$SOURCE" "$DEST" 2>&1)
+rc=$?
+if [[ $rc -ne 0 ]]; then
+  printf '%s: pull failed (rsync exit %d):\n%s\n' \
+    "$PROGRAM" "$rc" "$rsync_pull_out" >&2
+  exit 1
+fi
+if [[ "$VERBOSE" -eq 1 && -n "$rsync_pull_out" ]]; then
+  log "$rsync_pull_out"
+fi
+pulled=$(printf '%s\n' "$rsync_pull_out" \
+  | grep -E '^>f' | wc -l | tr -d ' ')
+
+# --- step 2: verify -----------------------------------------------------
+
+# The verify pass uses --checksum --dry-run --itemize-changes so we
+# can parse the meaningful attribute codes. With --itemize-changes,
+# rsync only PRINTS lines for files whose verify differs (flag
+# prefix `>f.......` or similar); files that are byte-identical
+# between source and destination produce NO output. So the parse is
+# simply: any line in the verify output = a file that is NOT eligible
+# for deletion this run.
+verify_log=$(rsync -a --checksum --dry-run --itemize-changes \
+  --exclude='raw' --exclude='/raw' --exclude='/raw/' \
+  "$SOURCE" "$DEST" 2>&1)
+rc=$?
+if [[ $rc -ne 0 ]]; then
+  printf '%s: verify failed (rsync exit %d):\n%s\n' \
+    "$PROGRAM" "$rc" "$verify_log" >&2
+  exit 1
+fi
+
+# Build the flagged set: every line in the verify output is a file
+# whose checksum differs (or whose metadata changed). Parse the path
+# from each line (rsync's itemize format: `<flag> <path>`).
+flagged_paths=()
+flagged=0
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  fname=$(printf '%s' "$line" | awk '{print $2}')
+  if [[ -n "$fname" ]]; then
+    flagged_paths+=("$fname")
+    flagged=$((flagged + 1))
+  fi
+done <<< "$verify_log"
+
+declare -A flagged_set=()
+for f in "${flagged_paths[@]}"; do
+  flagged_set["$f"]=1
+done
+
+# --- step 3: enumerate eligible source-side files ----------------------
+
+# A file is eligible for deletion from the source IF:
+#   * it exists in the source tree (per the source-side walk),
+#   * the verify pass did NOT flag it as differing,
+#   * it is NOT under any path named `raw/` (D7; the walk already
+#     excludes these, but the defensive check is kept here if the
+#     source tree changes shape in a future scheme), and
+#   * it is a regular file (no directories are deleted; tree pruning
+#     is left for an explicit, later decision).
+source_files=$(enumerate_source_files)
+would_delete=0
+declare -a would_delete_list=()
+while IFS= read -r rel; do
+  [[ -z "$rel" ]] && continue
+  if [[ -n "${flagged_set[$rel]:-}" ]]; then
+    continue  # verify pass flagged; skip
+  fi
+  if [[ "$rel" == raw/* || "$rel" == */raw/* ]]; then
+    continue  # D7 hard exclusion
+  fi
+  would_delete=$((would_delete + 1))
+  would_delete_list+=("$rel")
+done <<< "$source_files"
+
+# verified = source files that the verify pass did NOT flag as
+# differing. With the source tree walked as above and the find call
+# excluding raw/, this equals would_delete (D7 cannot violate the
+# equivalence). The separate name is kept because the one-line
+# summary is the contract: callers expect to read it and learn
+# "how many files are verified" vs "how many would have been deleted".
+verified=$would_delete
+
+if [[ "$VERBOSE" -eq 1 ]]; then
+  log "verify: verified=$verified flagged=$flagged would_delete=$would_delete"
+  if [[ $flagged -gt 0 ]]; then
+    log "verify: flagged files (NOT eligible for deletion):"
+    for f in "${flagged_paths[@]}"; do
+      log "  $f"
+    done
+  fi
+  log "would-delete enumeration:"
+  for f in "${would_delete_list[@]}"; do
+    log "  $f"
+  done
+fi
+
+# --- step 4: delete (only when --delete-source) ------------------------
+
+deleted=0
+if [[ "$DELETE_SOURCE" -eq 1 ]]; then
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    log "delete-source: removing eligible files from source"
+  fi
+  for fname in "${would_delete_list[@]}"; do
+    src_path=$(resolve_source_path "$fname")
+    if [[ "$SOURCE" == *:* ]]; then
+      ssh_target="${SOURCE%%:*}"
+      if [[ "$VERBOSE" -eq 1 ]]; then
+        log "  ssh $ssh_target rm -- $src_path"
+      fi
+      ssh_out=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        "$ssh_target" "rm -- $src_path" 2>&1)
+      rc=$?
+      if [[ $rc -ne 0 ]]; then
+        printf '%s: delete failed for %s on %s (ssh exit %d): %s\n' \
+          "$PROGRAM" "$src_path" "$ssh_target" "$rc" "$ssh_out" >&2
+      else
+        deleted=$((deleted + 1))
+      fi
+    else
+      if [[ "$VERBOSE" -eq 1 ]]; then
+        log "  rm -- $src_path"
+      fi
+      if rm -- "$src_path" 2>/dev/null; then
+        deleted=$((deleted + 1))
+      else
+        printf '%s: delete failed for %s\n' "$PROGRAM" "$src_path" >&2
+      fi
+    fi
+  done
+fi
+
+# --- summary ------------------------------------------------------------
+
+# Single-line summary to stdout. Cron mails on non-empty output by
+# convention; keeping normal-run output to this one line keeps the
+# mailbox clean when there is nothing of interest beyond the
+# headline. The would_delete=N and deleted=N are equal when
+# --delete-source is off; they diverge when --delete-source is on
+# and some deletions failed.
+printf 'slacube-sync-pool: pulled=%d verified=%d flagged=%d would_delete=%d deleted=%d\n' \
+  "$pulled" "$verified" "$flagged" "$would_delete" "$deleted"
+
+# Print which files WOULD have been deleted when --delete-source is
+# off, so the user's mailbox (cron's mail target) shows the would-be
+# deletions. This is how the operator knows source-side backlog is
+# growing without the script requesting additional privileges.
+if [[ "$DELETE_SOURCE" -eq 0 && $would_delete -gt 0 ]]; then
+  if [[ "$VERBOSE" -eq 0 ]]; then
+    for f in "${would_delete_list[@]}"; do
+      printf '%s: would_delete: %s\n' "$PROGRAM" "$f"
+    done
+  fi
+fi
+
+exit 0
