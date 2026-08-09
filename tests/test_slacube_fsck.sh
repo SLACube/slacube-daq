@@ -201,7 +201,114 @@ check $([[ $rc -eq 1 ]] && echo 1 || echo 0) "fsck: unset SLACUBE_DROPBOX -> exi
 echo "$out" | grep -qi 'SLACUBE_DROPBOX' && check 1 "fsck: error mentions SLACUBE_DROPBOX" || check 0 "fsck: error mentions SLACUBE_DROPBOX"
 
 
-# ---------------------------------------------------------- result
+# ---------------------------------------------------------- D7: pool/raw/ is never entered
+echo
+echo "[D7: pool/raw/ subtree is never visited by fsck]"
+eval "$(make_fixture)"
+mkdir -p "$POOL/raw"
+# Seed a file whose basename would match the converted twin if walked
+# (legacy tree carries pre-scheme data; not a real twin).
+touch "$POOL/raw/selftrigger_2026_02_21_21_52_18.h5"
+# Also seed a real twin-less raw so the section (a) findings list is
+# non-empty (the report still has to be valid; D7 does not silence
+# the section header).
+mkdir -p "$RAW_CACHE/2026/2026-02-21"
+touch "$RAW_CACHE/2026/2026-02-21/raw_2026_02_21_21_52_18.h5"
+
+out=$(SLACUBE_RAW_CACHE="$RAW_CACHE" \
+SLACUBE_DROPBOX="$DROPBOX" \
+SLACUBE_SPOOL="$SPOOL" \
+  slacube-fsck 2>&1)
+rc=$?
+check $([[ $rc -eq 0 ]] && echo 1 || echo 0) "D7: fsck exits 0 with pool/raw/ present"
+# The pool/raw/ file must NOT appear in any section of the report.
+echo "$out" | grep -q "$POOL/raw/" && check 0 "D7: pool/raw/ file is NOT listed anywhere" || check 1 "D7: pool/raw/ file is NOT listed anywhere"
+# Stderr note should mention pool/raw/ once (D7 exclusion fired).
+echo "$out" | grep -qi 'pool/raw/' && check 1 "D7: stderr note announces pool/raw/ exclusion" || check 0 "D7: stderr note announces pool/raw/ exclusion"
+rm -rf "$ROOT"
+
+# ---------------------------------------------------------- section (b) scans workdir too
+echo
+echo "[section (b): leftover .part/.tmp in workdir tree (Task 1's primary .part location)]"
+eval "$(make_fixture)"
+mkdir -p "$ROOT/scratch/workdir"
+touch "$DROPBOX/.selftrigger_2026_02_21_21_52_18.h5.part"
+touch "$ROOT/scratch/workdir/.selftrigger_2026_02_21_21_52_19.h5.part"
+
+out=$(SLACUBE_RAW_CACHE="$RAW_CACHE" \
+SLACUBE_DROPBOX="$DROPBOX" \
+SLACUBE_SPOOL="$SPOOL" \
+  slacube-fsck 2>&1)
+echo "$out" | grep -q 'leftover part' && check 1 "section (b) header present" || check 0 "section (b) header present"
+echo "$out" | awk '/leftover part/{f=1; next} /^##/{f=0} f' | grep -q 'scratch/workdir/.selftrigger_2026_02_21_21_52_19.h5.part' && check 1 "section (b) scans workdir tree" || check 0 "section (b) scans workdir tree"
+rm -rf "$ROOT"
+
+
+# ---------------------------------------------------------- _check_scoped: unreadable raw_cache
+echo
+echo "[config: unreadable scoped directory -> exit 1]"
+eval "$(make_fixture)"
+chmod 000 "$RAW_CACHE"
+out=$(SLACUBE_RAW_CACHE="$RAW_CACHE" \
+SLACUBE_DROPBOX="$DROPBOX" \
+SLACUBE_SPOOL="$SPOOL" \
+  slacube-fsck 2>&1)
+rc=$?
+chmod 755 "$RAW_CACHE"
+check $([[ $rc -eq 1 ]] && echo 1 || echo 0) "fsck: unreadable raw_cache -> exit 1"
+echo "$out" | grep -qi 'SLACUBE_RAW_CACHE' && check 1 "fsck: error mentions SLACUBE_RAW_CACHE" || check 0 "fsck: error mentions SLACUBE_RAW_CACHE"
+rm -rf "$ROOT"
+
+
+# ---------------------------------------------------------- _check_scoped: unreadable pool
+echo
+echo "[config: unreadable pool/ -> exit 1]"
+eval "$(make_fixture)"
+chmod 000 "$POOL"
+out=$(SLACUBE_RAW_CACHE="$RAW_CACHE" \
+SLACUBE_DROPBOX="$DROPBOX" \
+SLACUBE_SPOOL="$SPOOL" \
+  slacube-fsck 2>&1)
+rc=$?
+chmod 755 "$POOL"
+check $([[ $rc -eq 1 ]] && echo 1 || echo 0) "fsck: unreadable pool/ -> exit 1"
+echo "$out" | grep -qi 'pool' && check 1 "fsck: error mentions pool/" || check 0 "fsck: error mentions pool/"
+rm -rf "$ROOT"
+
+
+# ---------------------------------------------------------- TZ: failed-job age is correct
+# The "_parse_iso" function inside slacube-fsck must interpret a
+# naive-UTC ISO8601 timestamp as UTC, regardless of host $TZ. The
+# earlier implementation used datetime.strftime("%s"), which is
+# glibc-only and treats the parsed wall-clock time as local time --
+# so a failed-job 'finished' timestamp carries an error equal to the
+# host's UTC offset. Drive slacube-fsck under TZ=America/Los_Angeles
+# and assert the reported age is consistent with UTC, not local.
+echo
+echo "[TZ: failed-job age is computed against UTC, not host TZ]"
+eval "$(make_fixture)"
+# Seed a finished record exactly 1 hour ago in TRUE UTC.
+now_epoch=$(date -u +%s)
+finished_epoch=$((now_epoch - 3600))
+finished_utc=$(TZ=UTC date -u -d "@$finished_epoch" '+%Y-%m-%dT%H:%M:%S')
+cat > "$SPOOL/failed/raw_2026_02_21_21_52_18.json" <<JSON
+{"raw": "/scratch/raw_2026_02_21_21_52_18.h5", "submitted": "$finished_utc", "attempts": 3, "last_error": "x", "pid": null, "started": "$finished_utc", "finished": "$finished_utc", "duration_s": 42.0, "out": null}
+JSON
+
+out=$(TZ=America/Los_Angeles \
+SLACUBE_RAW_CACHE="$RAW_CACHE" \
+SLACUBE_DROPBOX="$DROPBOX" \
+SLACUBE_SPOOL="$SPOOL" \
+  slacube-fsck 2>&1)
+# Age must be within (0.5h, 1.5h) of "1 hour ago". The bug would
+# surface as an age shifted by 7-8 hours (PST offset) and so well
+# outside this band.
+age_line=$(echo "$out" | awk '/failed jobs/{f=1; next} /^##/{f=0} f' | grep raw_2026_02_21_21_52_18 | head -1)
+age_val=$(echo "$age_line" | grep -oE '[0-9]+\.[0-9]+h' | head -1 | tr -d 'h')
+check $([[ -n "$age_val" ]] && python3 -c "v=$age_val; import sys; sys.exit(0 if 0.5 <= v <= 1.5 else 1)" && echo 1 || echo 0) \
+  "TZ: failed-job age=${age_val}h is consistent with UTC (should be ~1h)"
+rm -rf "$ROOT"
+
 echo
 echo "============================================================"
 if [[ "$_failures" -ne 0 ]]; then

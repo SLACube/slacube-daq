@@ -151,6 +151,28 @@ def main():
         "/scratch/foo/dropbox -> /scratch/foo/pool",
         failures,
     )
+    # Trailing-slash trap: os.path.dirname("/x/y/") returns "/x/y"
+    # (the path itself), so pool_root_for must strip the trailing
+    # sep before computing dirname. Without the fix, this would
+    # resolve to "/data/slacube/dropbox/pool" (nested under dropbox).
+    _check(
+        paths.pool_root_for("/data/slacube/dropbox/")
+        == "/data/slacube/pool",
+        "/data/slacube/dropbox/ (trailing slash) -> /data/slacube/pool",
+        failures,
+    )
+    _check(
+        paths.pool_root_for("/scratch/foo/dropbox/")
+        == "/scratch/foo/pool",
+        "/scratch/foo/dropbox/ (trailing slash) -> /scratch/foo/pool",
+        failures,
+    )
+    _check(
+        paths.pool_root_for("/data/slacube/dropbox//")
+        == "/data/slacube/pool",
+        "/data/slacube/dropbox// (double trailing slash) -> /data/slacube/pool",
+        failures,
+    )
 
     # ---- stage_target_path ----
     print("\n[stage_target_path: composes pool/<type>/<year>/<date>/<basename>]")
@@ -267,6 +289,46 @@ def main():
             "None pool root, twin only in pool: False",
             failures,
         )
+
+        # Case 7: D7 legacy tree. A directory named `raw` directly
+        # under pool/ must never be visited -- even when it contains
+        # a file whose basename would otherwise match a converted
+        # twin (the legacy tree is pre-scheme data and not a real
+        # twin). The generator-based walk_pool() helper must prune
+        # the entry at the top of the walk, before descending.
+        legacy_raw = os.path.join(pool, "raw")
+        os.makedirs(legacy_raw)
+        # Seed a file whose basename *would* match a converted twin
+        # if the legacy tree were walked.
+        open(os.path.join(
+            legacy_raw, "selftrigger_2026_02_21_21_52_18.h5"),
+            "w").close()
+        _check(
+            not paths.has_converted_twin(
+                "raw_2026_02_21_21_52_18.h5", dropbox, pool),
+            "D7: has_converted_twin MUST NOT see pool/raw/ twin",
+            failures,
+        )
+        # walk_pool() itself must not yield pool/raw/.
+        walked = []
+        for dirpath, dirnames, _files in paths.walk_pool(pool):
+            walked.append(dirpath)
+        for dp in walked:
+            rel = os.path.relpath(dp, pool)
+            _check(
+                not (rel == "raw" or rel.startswith("raw" + os.sep)),
+                "D7: walk_pool does not descend into pool/raw/ "
+                "(visited: %s)" % dp,
+                failures,
+            )
+        # Remove the legacy file before the finally cleanup so rm -rf
+        # has nothing to complain about.
+        try:
+            os.remove(os.path.join(
+                legacy_raw, "selftrigger_2026_02_21_21_52_18.h5"))
+        except OSError:
+            pass
+        os.rmdir(legacy_raw)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

@@ -14,9 +14,14 @@ The helpers in this module centralise parsing of both, so
 reimplement the same regex/path code.
 
 This module is deliberately stdlib-only and importable from both a
-release (where ``scripts/`` is on ``$PYTHONPATH`` per ``deploy/env.sh.template``
-line 16) and a unit test (where the caller inserts the parent of this
-file's directory into ``sys.path``).
+release (executed from systemd/cron with no env sourced) and a unit
+test. The actual import mechanism used by every consumer in this
+repo is **explicit** ``sys.path.insert`` of ``../scripts`` relative
+to the consuming script's ``__file__`` (see the ``_HERE``/``_SCRIPTS``
+blocks at the top of ``bin/slacube-stage`` / ``bin/slacube-fsck`` /
+``bin/slacube-reap``); the ``PYTHONPATH`` entry in
+``deploy/env.sh.template`` covers a *separate* sibling repo's
+``scripts/`` directory and does not apply here.
 
 Public surface:
   classify_basename(basename) -> str|None
@@ -24,6 +29,7 @@ Public surface:
   parse_year_date(basename) -> (year, date)
   pool_root_for(dropbox_root) -> str
   stage_target_path(dropbox_root, basename) -> str|None
+  walk_pool(pool_root) -> generator
   has_converted_twin(raw_basename, dropbox_root, pool_root) -> bool
 """
 
@@ -33,15 +39,13 @@ import os
 
 
 # Converted-name prefixes, in longest-first order for safe matching.
-# Matches the file-type list in the data-management spec §2.1
-# (raw/selftrigger/exttrig/pedestal). The leading underscore is part of
-# the prefix, matching the convention ``raw_2026_..._18.h5`` →
-# ``selftrigger_2026_..._18.h5`` visible in
-# ``slacube-convert-and-move`` (deleted in Task 2 but the convention it
-# established lives on).
+# Matches the file-type list in the data-management spec (D2.1):
+# raw/selftrigger/exttrig/pedestal. The leading underscore is part of
+# the prefix, matching the convention ``raw_2026_..._18.h5`` to
+# ``selftrigger_2026_..._18.h5``.
 TYPE_PREFIXES = ("selftrigger_", "pedestal_", "exttrig_")
 
-# Forward (raw → converted) map mirroring ``slacube-convertd.submit``'s
+# Forward (raw to converted) map mirroring ``slacube-convertd.submit``'s
 # prefix substitution. A raw named ``exttrig_2026_..._18.h5`` produces a
 # converted file named ``exttrig_2026_..._18.h5`` (identity mapping):
 # exttrig acquisitions bypass the converter and land in dropbox verbatim.
@@ -52,6 +56,13 @@ RAW_TO_CONVERTED_PREFIX = (
     ("pedestal_", "pedestal_"),
     ("exttrig_", "exttrig_"),
 )
+
+
+# Subdirectory name (directly under pool/) that is part of the legacy
+# tree and must never be walked (D7). Exposed as a public constant so
+# the per-script walks in ``bin/slacube-fsck`` and ``bin/slacube-reap``
+# can share the same exclusion.
+LEGACY_POOL_RAW_DIRNAME = "raw"
 
 
 def classify_basename(basename):
@@ -109,12 +120,28 @@ def parse_year_date(basename):
         "basename %r does not carry a YYYY_MM_DD_* stamp" % base)
 
 
+def _strip_trailing_sep(path):
+    """Strip any trailing separator(s) from `path`. Defensive only
+    against a single trailing sep (typical `$SLACUBE_DROPBOX/` case);
+    deeper normalisations belong to ``os.path.normpath``.
+    """
+    if not path:
+        return path
+    return path.rstrip(os.sep)
+
+
 def pool_root_for(dropbox_root):
     """Return the pool root (parent of all type/<year>/<date>/ trees).
 
     Spec: pool root is ``dirname($SLACUBE_DROPBOX)/pool``.
+
+    The trailing-slash trap: ``os.path.dirname("/x/y/")`` returns
+    ``"/x/y"`` (the path itself, minus the trailing slash), not
+    ``"/x"``. Strip any trailing separator before dirname to avoid
+    silently nesting pool under dropbox.
     """
-    return os.path.join(os.path.dirname(dropbox_root), "pool")
+    return os.path.join(os.path.dirname(_strip_trailing_sep(dropbox_root)),
+                        "pool")
 
 
 def stage_target_path(dropbox_root, basename):
@@ -135,13 +162,40 @@ def stage_target_path(dropbox_root, basename):
         pool_root_for(dropbox_root), type_name, year, date, basename)
 
 
+def walk_pool(pool_root):
+    """Yield ``(dirpath, dirnames, filenames)`` for every directory
+    under ``pool_root`` EXCEPT a directory literally named ``raw``
+    that sits directly under ``pool_root`` (D7: legacy tree).
+
+    The exclusion is implemented by mutating the in-place
+    ``dirnames`` list when ``pool_root`` is the parent of a
+    ``raw`` entry, which is how ``os.walk`` honours pruning: a
+    top-level yield with the legacy entry removed from ``dirnames``
+    prevents the walk from descending into it at all (no I/O on the
+    legacy tree).
+    """
+    if not pool_root or not os.path.isdir(pool_root):
+        return
+    for dirpath, dirnames, filenames in os.walk(pool_root):
+        # Only the immediate children of pool_root are subject to the
+        # D7 exclusion; a ``raw`` directory deeper in the tree (e.g.
+        # ``pool/selftrigger/2026/raw/`` if a future task ever
+        # produced one) is fair game.
+        if os.path.normpath(dirpath) == os.path.normpath(pool_root):
+            dirnames[:] = [
+                d for d in dirnames if d != LEGACY_POOL_RAW_DIRNAME]
+        yield dirpath, dirnames, filenames
+
+
 def has_converted_twin(raw_basename, dropbox_root, pool_root):
     """Return True iff a file matching the converted twin basename
     exists in either ``dropbox_root`` directly or anywhere under
     ``pool_root`` (recursively).
 
     ``pool_root`` is the parent ``pool/`` directory; the function
-    walks every ``<type>/<year>/<date>/`` subdirectory under it. A
+    walks every ``<type>/<year>/<date>/`` subdirectory under it,
+    **excluding** any directory literally named ``raw`` directly
+    under the pool root (D7: legacy tree must never be entered). A
     raw whose twin would never exist (no mapping in
     ``RAW_TO_CONVERTED_PREFIX``) always returns False.
     """
@@ -153,7 +207,7 @@ def has_converted_twin(raw_basename, dropbox_root, pool_root):
         return True
     if not pool_root or not os.path.isdir(pool_root):
         return False
-    for dirpath, _dirs, files in os.walk(pool_root):
+    for _dirpath, _dirs, files in walk_pool(pool_root):
         if converted in files:
             return True
     return False

@@ -227,6 +227,34 @@ check $([[ -f "$RAW_CACHE/2026/2026-02-21/raw_2026_02_21_21_52_12.h5" ]] && echo
   "pool-twin: twin-less raw retained"
 rm -rf "$ROOT" "$fake_df"
 
+# ---------------------------------------------------------- D7: pool/raw/ not consulted for twin
+echo
+echo "[D7: pool/raw/ legacy tree is NOT consulted by reap]"
+eval "$(make_fixture)"
+mkdir -p "$RAW_CACHE/2026/2026-02-21"
+mkdir -p "$POOL/raw"
+# Twin-less raw in cache; a fake twin in pool/raw/ should NOT be
+# treated as a real twin (D7). Reap should retain the raw.
+touch "$RAW_CACHE/2026/2026-02-21/raw_2026_02_21_21_52_11.h5"
+touch "$POOL/raw/selftrigger_2026_02_21_21_52_11.h5"
+
+fake_df=$(make_fake_df)
+SLACUBE_REAP_TEST_DF_STATE="$ROOT/df_state" \
+REAP_TEST_DF_SCHEDULE="100 100 100 100 800 800 800 800 800 800" \
+PATH="$fake_df:$PATH" \
+SLACUBE_RAW_CACHE="$RAW_CACHE" \
+SLACUBE_DROPBOX="$DROPBOX" \
+SLACUBE_RAW_CACHE_LOW=$((500 * 1024 ** 3)) \
+SLACUBE_RAW_CACHE_HIGH=$((750 * 1024 ** 3)) \
+  slacube-reap >/dev/null 2>"$ROOT/out.log"
+rc=$?
+check $([[ $rc -eq 0 ]] && echo 1 || echo 0) "D7: exit 0"
+# Raw must still be present (the fake twin in pool/raw/ doesn't count).
+check $([[ -f "$RAW_CACHE/2026/2026-02-21/raw_2026_02_21_21_52_11.h5" ]] && echo 1 || echo 0) \
+  "D7: raw is NOT evicted (pool/raw/ legacy is not a twin)"
+grep -q 'raw_2026_02_21_21_52_11' "$ROOT/out.log" && check 1 "D7: log mentions the retained raw" || check 0 "D7: log mentions the retained raw"
+rm -rf "$ROOT" "$fake_df"
+
 
 # ---------------------------------------------------------- missing env: exit non-zero
 echo
@@ -235,7 +263,6 @@ out=$(unset SLACUBE_RAW_CACHE; SLACUBE_DROPBOX=/tmp slacube-reap 2>&1)
 rc=$?
 check $([[ $rc -ne 0 ]] && echo 1 || echo 0) "config: unset SLACUBE_RAW_CACHE -> non-zero"
 echo "$out" | grep -qi 'SLACUBE_RAW_CACHE' && check 1 "config: error mentions SLACUBE_RAW_CACHE" || check 0 "config: error mentions SLACUBE_RAW_CACHE"
-
 
 # ---------------------------------------------------------- result
 echo

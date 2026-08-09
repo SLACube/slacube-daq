@@ -28,8 +28,8 @@ Stdlib only (python3.8+); no third-party dependencies.
 """
 
 from __future__ import print_function
-
 import argparse
+import calendar
 import json
 import os
 import subprocess
@@ -45,17 +45,15 @@ from _slacube_paths import (  # noqa: E402
     has_converted_twin,
     pool_root_for,
     raw_basename_to_converted,
+    walk_pool,
 )
 
-
-# Directories literally named "raw" directly under pool/ belong to the
-# legacy tree (D7); never walked by fsck.
-LEGACY_POOL_RAW = "raw"
 
 # File age in hours beyond which a dropbox file is "stuck" (stage not
 # catching up). 24 h matches the spec; not configurable because it is
 # a contract, not an operator knob.
 STUCK_DROPBOX_HOURS = 24
+
 
 
 def _pool_root(dropbox):
@@ -119,36 +117,62 @@ def _section_a_raw_without_twin(raw_cache, dropbox, pool):
             findings.append("  " + full)
     return findings
 
+def _section_b_leftover_parts(dropbox, raw_cache, workdir):
+    """`.part` and `.tmp` files in two locations:
 
-def _section_b_leftover_parts(dropbox):
-    """`.part` and `.tmp` siblings in dropbox (and only dropbox -- the
-    raw cache is structured under <year>/<date>/ and the daemon does
-    not leave intermediates there)."""
+    1. dropbox -- transient copies the converter writes during the
+       sub-millisecond atomic publish.
+    2. The workdir tree under ``dirname($SLACUBE_RAW_CACHE)`` --
+       the *primary* location where Task 1's converter writes a
+       `.part` intermediate (D2 step 1) before the atomic publish
+       to dropbox. A converter that crashed mid-conversion leaves
+       a large `.part` file here; this is the case fsck's section
+       (b) is most useful for.
+    """
     findings = []
     for basename, full in _iter_workdir_dotfiles(dropbox):
         if basename.endswith(".part") or basename.endswith(".tmp"):
             findings.append("  " + full)
+    if workdir and os.path.isdir(workdir):
+        for dirpath, _dirs, files in os.walk(workdir):
+            for name in sorted(files):
+                if name.startswith(".") and (
+                        name.endswith(".part") or name.endswith(".tmp")):
+                    findings.append("  " + os.path.join(dirpath, name))
     return findings
 
 
 def _age_human(age_seconds):
     """Compact human-readable age (e.g. '3.2h', '5d')."""
-    if age_seconds < 0:
-        age_seconds = 0
-    if age_seconds >= 86400:
-        return "%.1fd" % (age_seconds / 86400.0)
-    return "%.1fh" % (age_seconds / 3600.0)
+    if age_seconds < 60:
+        return "%ds" % int(age_seconds)
+    if age_seconds < 3600:
+        return "%.1fm" % (age_seconds / 60.0)
+    if age_seconds < 86400:
+        return "%.1fh" % (age_seconds / 3600.0)
+    return "%.1fd" % (age_seconds / 86400.0)
 
 
 def _parse_iso(ts):
-    """Parse an ISO8601 timestamp to epoch seconds (best effort)."""
+    """Parse an ISO8601 Naive-UTC timestamp to epoch seconds.
+
+    Spool records use ``YYYY-MM-DDTHH:MM:SS`` strings that are naive
+    UTC by contract (the converter daemon stamps them via
+    ``datetime.utcnow().isoformat``). The earlier implementation
+    reached for ``strftime("%s")`` (a non-portable glibc extension),
+    which interprets the parsed wall time as **local** time and so
+    silently mis-computes the epoch on any non-UTC host -- making
+    the "age" reported for failed jobs off by the host's UTC offset
+    (e.g. by 7-8 h on a Pacific-time SDF box). This implementation
+    goes through ``calendar.timegm`` to honour the documented UTC
+    semantics regardless of host ``$TZ``.
+    """
     if not ts:
         return None
     try:
-        # Spool records use 'YYYY-MM-DDTHH:MM:SS' naive-UTC strings.
         from datetime import datetime
-        return int(datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S"
-                                     ).strftime("%s"))
+        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S")
+        return calendar.timegm(dt.timetuple())
     except (ValueError, ImportError):
         return None
 
@@ -230,6 +254,7 @@ def _df_free_bytes(path):
         return None
 
 def _human_bytes(n):
+    """Format a byte count for human display (binary, 1 decimal)."""
     if n is None:
         return "unavailable"
     if n >= 1024 ** 4:
@@ -239,7 +264,6 @@ def _human_bytes(n):
     if n >= 1024 ** 2:
         return "%.1f MiB" % (n / float(1024 ** 2))
     return "%d B" % n
-
 
 def _section_f_free_space(raw_cache, dropbox, spool):
     """Free bytes per tier plus a count of dropbox/pool files whose
@@ -268,7 +292,9 @@ def _section_f_free_space(raw_cache, dropbox, spool):
     pool_set = set()
     pool_root = _pool_root(dropbox)
     if os.path.isdir(pool_root):
-        for _dirpath, _dirs, files in os.walk(pool_root):
+        # Use walk_pool() so the legacy pool/raw/ subtree is pruned
+        # from the walk (D7).
+        for _dirpath, _dirs, files in walk_pool(pool_root):
             for f in files:
                 pool_set.add(f)
     raw_set = set()
@@ -288,15 +314,24 @@ def _section_f_free_space(raw_cache, dropbox, spool):
         if not converted.endswith(".h5"):
             continue
         prefix = None
-        for k in inverted:
-            if converted.startswith(k):
-                prefix = inverted[k]
+        k = None
+        for candidate in inverted:
+            if converted.startswith(candidate):
+                prefix = inverted[candidate]
+                k = candidate
                 break
-        if prefix is None:
+        if prefix is None or k is None:
             continue
-        raw_form = prefix + converted[len(k):] if False else (
-            prefix + converted.split("_", 1)[1] if "_" in converted
-            else None)
+        # All current prefixes end in a single underscore and contain
+        # no internal underscores, so stripping the whole prefix
+        # (`converted[len(k):]`) and splitting on the first underscore
+        # are equivalent. The split form is kept for forward
+        # compatibility with prefixes that may one day contain an
+        # internal underscore.
+        if "_" in converted[len(k):]:
+            raw_form = prefix + converted[len(k):]
+        else:
+            raw_form = None
         if raw_form is None or raw_form not in raw_set:
             twinless += 1
     if twinless:
@@ -307,8 +342,16 @@ def _section_f_free_space(raw_cache, dropbox, spool):
 
 
 def _check_scoped(path, label):
-    """Verify a scoped directory is readable. Returns True if so,
-    False otherwise (caller decides whether to fail hard)."""
+    """Verify a scoped directory is *readable*, not just `isdir`-able.
+
+    `os.path.isdir` succeeds on a permission-denied directory
+    (kernel only requires execute on the parent), so it can return
+    True for a directory we cannot read. We confirm readability by
+    attempting an actual listdir, which exercises the read bit on
+    the directory itself -- the exact operation every consumer of
+    this report relies on. Returns True on success, False on any
+    failure (caller decides whether to fail hard).
+    """
     if not path:
         sys.stderr.write("slacube-fsck: %s path is not set\n" % label)
         return False
@@ -316,9 +359,11 @@ def _check_scoped(path, label):
         sys.stderr.write("slacube-fsck: %s not a directory: %s\n"
                          % (label, path))
         return False
-    if not os.access(path, os.R_OK | os.X_OK):
-        sys.stderr.write("slacube-fsck: %s not readable: %s\n"
-                         % (label, path))
+    try:
+        os.listdir(path)
+    except OSError as exc:
+        sys.stderr.write("slacube-fsck: %s not readable: %s (%s)\n"
+                         % (label, path, exc))
         return False
     return True
 
@@ -343,44 +388,54 @@ def main(argv=None):
 
     pool_root = _pool_root(dropbox)
 
-    # Hard-fail on unreadable scoped dirs; absent optional dirs get
-    # empty sections rather than a fatal exit.
+    # Hard-fail on UNREADABLE scoped dirs. The spec scopes fsck to
+    # four tiers ("raw_cache" / "spool" / "dropbox" / "pool"); any of
+    # them being unreadable (whether permission-denied, vanished, or
+    # not configured) is a hard exit 1 so the operator notices
+    # cleanly. `$SLACUBE_RAW_CACHE` and `pool/` are optional from an
+    # on-disk-existence standpoint (a deployment may start with
+    # neither) but a `chmod 000` raw cache or pool does NOT count as
+    # "absent" -- we must still report.
+    # The workdir side (Task 1's primary .part location) is the
+    # parent of `$SLACUBE_RAW_CACHE` -- the brief explicitly names
+    # `/scratch/slacube` as the scope. We pass that whole subtree
+    # to `_section_b_leftover_parts` so it walks every subdir.
+    workdir = os.path.dirname(raw_cache) if raw_cache else ""
+
     ok = True
     if not _check_scoped(dropbox, "$SLACUBE_DROPBOX"):
         ok = False
+    if raw_cache and not _check_scoped(raw_cache, "$SLACUBE_RAW_CACHE"):
+        ok = False
     if spool and not _check_scoped(spool, "$SLACUBE_SPOOL"):
+        ok = False
+    if pool_root and not _check_scoped(pool_root, "pool/"):
         ok = False
     if not ok:
         return 1
 
-    # Defensive: skip pool/raw/ even if it exists (D7).
-    legacy_raw = os.path.join(pool_root, LEGACY_POOL_RAW)
+    # D7: the legacy pool/raw/ subtree is pruned via walk_pool() in
+    # the shared helper; no extra logic needed here. We still print a
+    # one-line stderr note when the legacy subtree exists, so the
+    # operator sees that the exclusion fired.
+    legacy_raw = os.path.join(pool_root, "raw")
     if os.path.isdir(legacy_raw):
         sys.stderr.write(
             "slacube-fsck: note -- pool/raw/ exists; not walking it (D7)\n")
 
-    pool_for_search = pool_root
-    if os.path.isdir(legacy_raw):
-        # Walk pool/ but skip the legacy_raw subtree entirely.
-        # has_converted_twin walks pool_root; the spec says pool/raw is
-        # legacy and never contains twin files (D7), so for the
-        # twin-check we pass pool_root as-is -- the walk will visit
-        # legacy_raw's files but they are not `selftrigger_*`/
-        # `pedestal_*`/`exttrig_*` so they will never match.
-        pass
-
     print("# slacube-fsck report")
     print("")
 
-    if raw_cache and os.path.isdir(raw_cache):
+    if raw_cache:
         _print_section(
             "(a) raw without converted twin",
-            _section_a_raw_without_twin(raw_cache, dropbox, pool_for_search))
+            _section_a_raw_without_twin(raw_cache, dropbox, pool_root))
     else:
         _print_section("(a) raw without converted twin",
-                       ["  $SLACUBE_RAW_CACHE not set or not a directory"])
-    _print_section("(b) leftover part/tmp in dropbox",
-                   _section_b_leftover_parts(dropbox))
+                       ["  $SLACUBE_RAW_CACHE not set"])
+    _print_section(
+        "(b) leftover part/tmp in dropbox and workdir",
+        _section_b_leftover_parts(dropbox, raw_cache, workdir))
     if spool:
         _print_section("(c) failed jobs", _section_c_failed_jobs(spool))
     else:
@@ -390,9 +445,13 @@ def main(argv=None):
                    % STUCK_DROPBOX_HOURS,
                    _section_d_stuck_dropbox(dropbox))
     _print_section("(e) pool S3DF verification", _section_e_pool_s3df())
-    _print_section("(f) free space per tier",
-                   _section_f_free_space(raw_cache or "/", dropbox,
-                                         spool or "/"))
+    if raw_cache:
+        _print_section("(f) free space per tier",
+                       _section_f_free_space(raw_cache, dropbox,
+                                             spool or "/"))
+    else:
+        _print_section("(f) free space per tier",
+                       _section_f_free_space("/", dropbox, spool or "/"))
 
     return 0
 
