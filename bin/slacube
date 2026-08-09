@@ -735,12 +735,26 @@ cmd_power()
     *) echo "Usage: $PROGRAM power [status|down|help]"
   esac
 }
+
+cmd_queue()
+{
+  case "$1" in
+    logs) shift;
+      journalctl --user -u slacube-convert.service "$@"
+      ;;
+    help) shift; show_help queue ;;
+    *)
+      slacube-convertd "$@"
+      ;;
+  esac
+}
 # }}}
 # ====================================
 # main() {{{
 # ====================================
-# check workdir except running with no argument or "env,help,power"
-[[ $# -eq 0 || "$1" == "env" || "$1" == "help" || "$1" == "power" || "$2" == "help" ]] || check_workdir
+# check workdir except running with no argument or "env,help,power,queue"
+# (queue works against the spool, not the workdir)
+[[ $# -eq 0 || "$1" == "env" || "$1" == "help" || "$1" == "power" || "$1" == "queue" || "$2" == "help" ]] || check_workdir
 
 case "$1" in
   env)         shift; cmd_env "$@"        ;;
@@ -755,8 +769,8 @@ case "$1" in
   run)         shift; cmd_run "$@"        ;;
   cfg)         shift; cmd_cfg "$@"        ;;
   power)       shift; cmd_power "$@"      ;;
-  help)        shift; show_help slacube   ;;
+  queue)       shift; cmd_queue "$@"      ;;
   *)           show_version               ;;
-esac
+  esac
 # }}}
 # ====================================

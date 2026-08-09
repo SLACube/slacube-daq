@@ -1,0 +1,906 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""slacube-convertd -- conversion daemon and spool CLI for SLACube DAQ.
+
+Manages a filesystem-only spool of conversion jobs. Each job is a JSON
+record in `$SLACUBE_SPOOL/{incoming,running,failed,done}/`. The daemon
+loop polls incoming/, claims via os.rename(), runs slacube-convert-raw.py
+in a subprocess under a timeout, and publishes the converted file to
+$SLACUBE_DROPBOX atomically.
+
+Stdlib only (python3.8+); no third-party dependencies.
+"""
+
+from __future__ import print_function
+
+import argparse
+import contextlib
+import errno
+import fcntl
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+
+# ---------------------------------------------------------------- defaults
+DEFAULT_POLL = 5
+DEFAULT_WORKERS = 2
+DEFAULT_TIMEOUT = 1800
+DEFAULT_ATTEMPTS = 3
+DEFAULT_MAX_CONSECUTIVE_FAIL = 3
+DEFAULT_BACKOFF_CAP_MINUTES = 30
+
+SPOOL_SUBDIRS = ("incoming", "running", "failed", "done")
+
+
+# ---------------------------------------------------------------- errors
+class ConvertdError(Exception):
+    """Base error for slacube-convertd operations."""
+
+
+class MissingEnv(ConvertdError):
+    """A required environment variable was not set."""
+
+
+class AlreadyRunning(ConvertdError):
+    """Another daemon instance already holds the spool lock."""
+
+
+class JobNotFound(ConvertdError):
+    """A named job was not found in the requested spool subdirectory."""
+
+
+# ---------------------------------------------------------------- utilities
+def _now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _require_env(name):
+    val = os.environ.get(name)
+    if not val:
+        raise MissingEnv("required env var %s is not set" % name)
+    return val
+
+
+def _atomic_rename(src, dst):
+    """Rename src to dst. Same-filesystem atomic rename."""
+    os.rename(src, dst)
+
+
+def atomic_write_json(path, obj):
+    """Write obj as JSON to path atomically (tmp + rename).
+
+    The .tmp sibling is created in the same directory so the rename is
+    guaranteed to be same-filesystem.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(obj, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    _atomic_rename(tmp, path)
+
+
+def read_json(path):
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def list_jobs(spool_root):
+    """Return {incoming, running, failed, done} as lists of full paths."""
+    out = {}
+    for sub in SPOOL_SUBDIRS:
+        d = os.path.join(spool_root, sub)
+        if not os.path.isdir(d):
+            out[sub] = []
+            continue
+        out[sub] = sorted(
+            os.path.join(d, f)
+            for f in os.listdir(d)
+            if f.endswith(".json") and not f.startswith(".")
+        )
+    return out
+
+
+def job_name_from_record_path(path):
+    return os.path.basename(path)[:-len(".json")]
+
+
+def job_record_path(spool_root, sub, name):
+    return os.path.join(spool_root, sub, name + ".json")
+
+
+# ---------------------------------------------------------------- classification
+def classify_basename(basename):
+    """Map a raw basename to the converted-file prefix.
+
+    Returns the destination prefix (e.g. "selftrigger_") or None if the
+    basename cannot be classified. Convention mirrors slacube-convert-and-move:
+    `raw_*` -> `selftrigger_*` and `pedestal_*` -> `pedestal_*` is preserved.
+    Anything else returns None.
+    """
+    if basename.startswith("raw_"):
+        return "selftrigger_"
+    if basename.startswith("pedestal_"):
+        return "pedestal_"
+    return None
+
+
+def parse_year_date(basename):
+    """Extract (year, date) from a `raw_YYYY_MM_DD_HH_MM_SS.h5` style name.
+
+    Returns (year, date) as strings. Raises ValueError on no match.
+    """
+    base = os.path.basename(basename)
+    parts = base.replace(".h5", "").split("_")
+    # Need at least year _ month _ day
+    if len(parts) < 4:
+        raise ValueError("basename %r does not carry a YYYY_MM_DD_* stamp" % base)
+    year, month, day = parts[1], parts[2], parts[3]
+    if not (len(year) == 4 and year.isdigit()
+            and len(month) == 2 and month.isdigit()
+            and len(day) == 2 and day.isdigit()):
+        raise ValueError("basename %r does not carry a YYYY_MM_DD_* stamp" % base)
+    return year, "%s-%s-%s" % (year, month, day)
+
+
+# ---------------------------------------------------------------- submit
+def submit(raw_path, spool_root, dropbox_root, now_fn=_now_iso):
+    """Submit a job to incoming/.
+
+    Returns a (status, message, record) tuple where status is one of:
+    - "ok": job created in incoming/
+    - "duplicate": job of the same basename already exists in any spool dir
+    - "unclassifiable": basename not under a known convention -> failed/
+    """
+    raw_path = os.path.abspath(raw_path)
+    if not os.path.isfile(raw_path):
+        raise ConvertdError("raw file not found: %s" % raw_path)
+
+    basename = os.path.basename(raw_path)
+    job_name = basename[:-len(".h5")] if basename.endswith(".h5") else os.path.splitext(basename)[0]
+
+    # Duplicate check across all spool subdirs
+    for sub in SPOOL_SUBDIRS:
+        if os.path.isfile(job_record_path(spool_root, sub, job_name)):
+            return "duplicate", "job %s already exists in %s/" % (job_name, sub), None
+
+    prefix = classify_basename(basename)
+    if prefix is None:
+        # Unclassifiable -> fail immediately
+        rec = {
+            "raw": raw_path,
+            "submitted": now_fn(),
+            "attempts": 0,
+            "not_before": None,
+            "last_error": "unclassifiable",
+            "pid": None,
+            "started": None,
+            "finished": now_fn(),
+            "duration_s": 0.0,
+            "out": None,
+        }
+        atomic_write_json(job_record_path(spool_root, "failed", job_name), rec)
+        return "unclassifiable", "basename %r is not classifiable" % basename, rec
+
+    out_basename = prefix + basename[len("raw_"):] if basename.startswith("raw_") else prefix + basename[len("pedestal_"):]
+    out_path = os.path.join(dropbox_root, out_basename)
+
+    rec = {
+        "raw": raw_path,
+        "submitted": now_fn(),
+        "attempts": 0,
+        "not_before": None,
+        "last_error": None,
+        "pid": None,
+        "started": None,
+        "finished": None,
+        "duration_s": None,
+        "out": out_path,
+    }
+    atomic_write_json(job_record_path(spool_root, "incoming", job_name), rec)
+    return "ok", "submitted %s" % job_name, rec
+
+
+# ---------------------------------------------------------------- claim
+def claim_job(spool_root, job_name):
+    """Atomically move incoming/<job>.json to running/<job>.json.
+
+    Returns the new running path, or None if the incoming entry is gone
+    (race with another worker).
+    """
+    src = job_record_path(spool_root, "incoming", job_name)
+    dst = job_record_path(spool_root, "running", job_name)
+    try:
+        os.rename(src, dst)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT,):
+            return None
+        raise
+    return dst
+
+
+# ---------------------------------------------------------------- process pipeline
+def _backoff_minutes(attempts):
+    """Return the backoff in minutes for the given attempts count."""
+    minutes = 2 ** attempts
+    if minutes > DEFAULT_BACKOFF_CAP_MINUTES:
+        return DEFAULT_BACKOFF_CAP_MINUTES
+    return minutes
+
+
+def _part_path_for(out_path):
+    """Return the hidden .part path matching an out path."""
+    parent = os.path.dirname(out_path)
+    base = os.path.basename(out_path)
+    return os.path.join(parent, "." + base + ".part")
+
+
+def _clean_part_files(*paths):
+    for p in paths:
+        with contextlib.suppress(OSError):
+            os.remove(p)
+
+
+def _backoff_iso(attempts, now_fn=_now_iso):
+    minutes = _backoff_minutes(attempts)
+    # not_before = "now + minutes minutes"
+    dt = datetime.strptime(now_fn(), "%Y-%m-%dT%H:%M:%S")
+    dt2 = dt + timedelta(minutes=minutes)
+    return dt2.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _publish_converted(part_path, dropbox_root, basename):
+    """Move part file into the dropbox atomically.
+
+    Copies to <dropbox>/.<basename>.part then renames to <dropbox>/<basename>.
+    Returns the final published path.
+    """
+    parent_part = os.path.join(dropbox_root, "." + basename + ".part")
+    shutil.copyfile(part_path, parent_part)
+    final = os.path.join(dropbox_root, basename)
+    os.rename(parent_part, final)
+    return final
+
+
+def _move_raw_to_cache(raw_path, raw_cache_root):
+    """Move the raw file into raw_cache_root/<year>/<date>/basename.
+
+    Returns the new path. Raises on failure.
+    """
+    basename = os.path.basename(raw_path)
+    year, date = parse_year_date(basename)
+    target_dir = os.path.join(raw_cache_root, year, date)
+    os.makedirs(target_dir, exist_ok=True)
+    target = os.path.join(target_dir, basename)
+    # Same-filesystem rename (raw and cache live on /scratch)
+    os.rename(raw_path, target)
+    return target
+
+
+def _run_converter(raw_path, part_path, converter, extra_args=None):
+    """Spawn the converter subprocess in its own process group.
+
+    Returns the subprocess.Popen handle. The caller is responsible for
+    waiting on it (with a timeout) and killing the process group on timeout.
+    """
+    args = [converter, "--input_filename", raw_path, "--output_filename", part_path]
+    if extra_args:
+        args.extend(extra_args)
+    proc = subprocess.Popen(
+        args,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    return proc
+
+
+def process_job(running_path, dropbox_root, raw_cache_root, workdir_root,
+                converter=None, timeout=None, attempts_max=None,
+                extra_args=None, now_fn=_now_iso):
+    """Run the full per-job pipeline.
+
+    Steps:
+      1. Convert to <dirname(out)>/.<basename(out)>.part
+      2. Copy part -> dropbox atomic publish
+      3. Move raw -> raw_cache/<year>/<date>/
+      4. Move job record to done/ (or back to incoming/ on retry, or failed/ on exhaustion)
+
+    Returns (outcome, record). outcome is "ok" or "fail". The record is
+    the updated job dict (post-mutation).
+    """
+    if timeout is None:
+        timeout = int(os.environ.get("SLACUBE_CONVERT_TIMEOUT", str(DEFAULT_TIMEOUT)))
+    if attempts_max is None:
+        attempts_max = int(os.environ.get("SLACUBE_CONVERT_ATTEMPTS", str(DEFAULT_ATTEMPTS)))
+    if converter is None:
+        converter = os.environ.get("SLACUBE_CONVERTER", "slacube-convert-raw.py")
+
+    rec = read_json(running_path)
+    job_name = job_name_from_record_path(running_path)
+    spool_root = os.path.dirname(os.path.dirname(running_path))
+    out_path = rec["out"]
+    raw_path = rec["raw"]
+    out_basename = os.path.basename(out_path)
+    # Step 1 location: under workdir_root, NOT dropbox (D2 spec).
+    part_path = os.path.join(workdir_root, "." + out_basename + ".part")
+    rec["attempts"] = int(rec.get("attempts", 0)) + 1
+    rec["started"] = now_fn()
+    atomic_write_json(running_path, rec)
+
+    # Clean any pre-existing .part files for this job
+    _clean_part_files(part_path, _part_path_for(out_path))
+
+    failure_reason = None
+    rc = 1
+    try:
+        proc = _run_converter(raw_path, part_path, converter, extra_args=extra_args)
+        rec["pid"] = proc.pid
+        atomic_write_json(running_path, rec)
+
+        try:
+            out, err = proc.communicate(timeout=timeout)
+            rc = proc.returncode
+            if rc != 0:
+                failure_reason = "converter exited %d: %s" % (rc, (err or b"").decode("utf-8", "replace").strip())
+        except subprocess.TimeoutExpired:
+            # Kill the whole process group with SIGKILL
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            failure_reason = "timeout after %ds" % timeout
+            rc = None
+    except Exception as exc:  # pragma: no cover - defensive
+        failure_reason = "spawn error: %s" % exc
+        rc = 1
+
+    # ----- failure path
+    if rc != 0:
+        _clean_part_files(part_path, _part_path_for(out_path))
+        rec["pid"] = None
+        rec["last_error"] = failure_reason or "converter exited %d" % (rc or 1)
+        if rec["attempts"] < attempts_max:
+            rec["not_before"] = _backoff_iso(rec["attempts"], now_fn=now_fn)
+            atomic_write_json(job_record_path(spool_root, "incoming", job_name), rec)
+            with contextlib.suppress(OSError):
+                os.remove(running_path)
+        else:
+            # Exhausted attempts: failed/
+            rec["finished"] = now_fn()
+            if rec.get("started"):
+                try:
+                    t0 = datetime.strptime(rec["started"], "%Y-%m-%dT%H:%M:%S")
+                    t1 = datetime.strptime(rec["finished"], "%Y-%m-%dT%H:%M:%S")
+                    rec["duration_s"] = max(0.0, (t1 - t0).total_seconds())
+                except ValueError:
+                    rec["duration_s"] = None
+            atomic_write_json(job_record_path(spool_root, "failed", job_name), rec)
+            with contextlib.suppress(OSError):
+                os.remove(running_path)
+        return "fail", rec
+
+    # ----- success path
+    # Step 2: copy part -> dropbox atomic publish
+    try:
+        _publish_converted(part_path, dropbox_root, out_basename)
+    except Exception as exc:
+        # If we can't publish, treat as failure but do NOT re-touch the raw or dropbox final
+        _clean_part_files(part_path, _part_path_for(out_path))
+        rec["pid"] = None
+        rec["last_error"] = "publish failed: %s" % exc
+        if rec["attempts"] < attempts_max:
+            rec["not_before"] = _backoff_iso(rec["attempts"], now_fn=now_fn)
+            atomic_write_json(job_record_path(spool_root, "incoming", job_name), rec)
+            with contextlib.suppress(OSError):
+                os.remove(running_path)
+        else:
+            rec["finished"] = now_fn()
+            atomic_write_json(job_record_path(spool_root, "failed", job_name), rec)
+            with contextlib.suppress(OSError):
+                os.remove(running_path)
+        return "fail", rec
+
+    # Step 3: move raw -> raw cache
+    try:
+        _move_raw_to_cache(raw_path, raw_cache_root)
+    except Exception as exc:
+        # If raw move fails, we already published to dropbox. Best-effort: revert? Mark failed.
+        rec["pid"] = None
+        rec["last_error"] = "raw cache move failed: %s" % exc
+        rec["finished"] = now_fn()
+        atomic_write_json(job_record_path(spool_root, "failed", job_name), rec)
+        with contextlib.suppress(OSError):
+            os.remove(running_path)
+        return "fail", rec
+
+    # Step 4: finalize
+    rec["finished"] = now_fn()
+    if rec.get("started"):
+        try:
+            t0 = datetime.strptime(rec["started"], "%Y-%m-%dT%H:%M:%S")
+            t1 = datetime.strptime(rec["finished"], "%Y-%m-%dT%H:%M:%S")
+            rec["duration_s"] = max(0.0, (t1 - t0).total_seconds())
+        except ValueError:
+            rec["duration_s"] = None
+    rec["pid"] = None
+    atomic_write_json(job_record_path(spool_root, "done", job_name), rec)
+    with contextlib.suppress(OSError):
+        os.remove(running_path)
+    # clean leftover part under workdir
+    _clean_part_files(part_path)
+    return "ok", rec
+
+
+# ---------------------------------------------------------------- status
+def _parse_iso(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def consecutive_failures(spool_root):
+    """Number of failed/ records whose `finished` is >= the newest done/ `finished`.
+
+    If done/ is empty, returns the count of all failed/ records.
+    """
+    failed = list_jobs(spool_root)["failed"]
+    done = list_jobs(spool_root)["done"]
+    if not failed:
+        return 0
+    if not done:
+        return len(failed)
+    newest_done_ts = None
+    for p in done:
+        rec = read_json(p)
+        ts = _parse_iso(rec.get("finished"))
+        if ts and (newest_done_ts is None or ts > newest_done_ts):
+            newest_done_ts = ts
+    if newest_done_ts is None:
+        return len(failed)
+    count = 0
+    for p in failed:
+        rec = read_json(p)
+        ts = _parse_iso(rec.get("finished"))
+        if ts is None or ts >= newest_done_ts:
+            count += 1
+    return count
+
+
+def compute_status(spool_root, max_consecutive=None):
+    """Compute spool counts and exit code for `status`."""
+    if max_consecutive is None:
+        max_consecutive = int(os.environ.get("SLACUBE_MAX_CONSECUTIVE_FAIL",
+                                             str(DEFAULT_MAX_CONSECUTIVE_FAIL)))
+    counts = {sub: len(list_jobs(spool_root)[sub]) for sub in SPOOL_SUBDIRS}
+    pending = counts["incoming"]
+    running = counts["running"]
+    failed = counts["failed"]
+    done = counts["done"]
+    consec = consecutive_failures(spool_root)
+    if failed == 0:
+        exit_code = 0
+    elif consec >= max_consecutive:
+        exit_code = 1
+    else:
+        exit_code = 2
+    return {
+        "counts": {
+            "pending": pending,
+            "running": running,
+            "failed": failed,
+            "done": done,
+        },
+        "consecutive_fail": consec,
+        "exit_code": exit_code,
+    }
+
+
+# ---------------------------------------------------------------- requeue running/
+def requeue_running(spool_root, workdir_root):
+    """Crash recovery: re-queue every entry in running/ back to incoming/.
+
+    Increments attempts, sets last_error='interrupted', and deletes any
+    .part files implied by the job's `out` path (and a sibling under
+    workdir_root).
+    """
+    for src in list_jobs(spool_root)["running"]:
+        rec = read_json(src)
+        job_name = job_name_from_record_path(src)
+        rec["attempts"] = int(rec.get("attempts", 0)) + 1
+        rec["last_error"] = "interrupted"
+        rec["pid"] = None
+        rec["started"] = None
+        rec["not_before"] = None
+        # Drop leftover .part files
+        out_path = rec.get("out")
+        if out_path:
+            _clean_part_files(_part_path_for(out_path))
+            if workdir_root:
+                base = os.path.basename(out_path)
+                _clean_part_files(os.path.join(workdir_root, "." + base + ".part"))
+        atomic_write_json(job_record_path(spool_root, "incoming", job_name), rec)
+        with contextlib.suppress(OSError):
+            os.remove(src)
+
+
+# ---------------------------------------------------------------- retry / ack
+def retry(spool_root, job_name):
+    """Move failed/<job>.json to incoming/<job>.json, resetting attempts/last_error."""
+    src = job_record_path(spool_root, "failed", job_name)
+    if not os.path.isfile(src):
+        raise JobNotFound("no failed job named %r" % job_name)
+    rec = read_json(src)
+    rec["attempts"] = 0
+    rec["last_error"] = None
+    rec["not_before"] = None
+    rec["started"] = None
+    rec["finished"] = None
+    rec["duration_s"] = None
+    rec["pid"] = None
+    atomic_write_json(job_record_path(spool_root, "incoming", job_name), rec)
+    with contextlib.suppress(OSError):
+        os.remove(src)
+
+
+def ack(spool_root, job_name):
+    """Move failed/<job>.json to done/<job>.json with outcome='acked'."""
+    src = job_record_path(spool_root, "failed", job_name)
+    if not os.path.isfile(src):
+        raise JobNotFound("no failed job named %r" % job_name)
+    rec = read_json(src)
+    rec["outcome"] = "acked"
+    atomic_write_json(job_record_path(spool_root, "done", job_name), rec)
+    with contextlib.suppress(OSError):
+        os.remove(src)
+
+
+# ---------------------------------------------------------------- drain
+def drain(spool_root, poll_interval=None, timeout=None):
+    """Block until incoming/ and running/ are both empty, then return True."""
+    if poll_interval is None:
+        poll_interval = float(os.environ.get("SLACUBE_DRAIN_POLL", "1"))
+    if timeout is None:
+        timeout = float(os.environ.get("SLACUBE_DRAIN_TIMEOUT", "86400"))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        lists = list_jobs(spool_root)
+        if not lists["incoming"] and not lists["running"]:
+            return True
+        time.sleep(poll_interval)
+    return False
+
+
+# ---------------------------------------------------------------- serve loop
+def _serve_once(spool_root, dropbox_root, raw_cache_root, workdir_root,
+                converter=None, timeout=None, attempts_max=None):
+    """Run one poll-and-dispatch pass. Returns the number of jobs claimed."""
+    claimed = 0
+    for incoming in list_jobs(spool_root)["incoming"]:
+        job_name = job_name_from_record_path(incoming)
+        running = claim_job(spool_root, job_name)
+        if running is None:
+            continue
+        claimed += 1
+        process_job(running, dropbox_root, raw_cache_root, workdir_root,
+                    converter=converter, timeout=timeout, attempts_max=attempts_max)
+    return claimed
+
+
+def _serve_loop(spool_root, dropbox_root, raw_cache_root, workdir_root,
+                workers=None, poll_interval=None, once=False, lock_fd=None):
+    """The daemon loop."""
+    if workers is None:
+        workers = int(os.environ.get("SLACUBE_CONVERT_WORKERS", str(DEFAULT_WORKERS)))
+    if poll_interval is None:
+        poll_interval = float(os.environ.get("SLACUBE_CONVERT_POLL", str(DEFAULT_POLL)))
+
+    # Crash recovery on startup
+    requeue_running(spool_root, workdir_root)
+
+    if once:
+        # Single-pass: dispatch synchronously across `workers` worker threads
+        lock = threading.Lock()
+        active = []
+        for incoming in list_jobs(spool_root)["incoming"]:
+            job_name = job_name_from_record_path(incoming)
+            running = claim_job(spool_root, job_name)
+            if running is None:
+                continue
+            t = threading.Thread(
+                target=_worker_run,
+                args=(lock, running, dropbox_root, raw_cache_root, workdir_root),
+                daemon=True,
+            )
+            t.start()
+            active.append(t)
+        for t in active:
+            t.join()
+        return
+
+    # Long-running loop
+    stop = threading.Event()
+
+    def _stop_handler(signum, frame):
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _stop_handler)
+    signal.signal(signal.SIGINT, _stop_handler)
+
+    while not stop.is_set():
+        active = []
+        lock = threading.Lock()
+        for incoming in list_jobs(spool_root)["incoming"]:
+            job_name = job_name_from_record_path(incoming)
+            running = claim_job(spool_root, job_name)
+            if running is None:
+                continue
+            t = threading.Thread(
+                target=_worker_run,
+                args=(lock, running, dropbox_root, raw_cache_root, workdir_root),
+                daemon=True,
+            )
+            t.start()
+            active.append(t)
+        for t in active:
+            while t.is_alive():
+                if stop.wait(timeout=0.5):
+                    return
+            t.join()
+        if stop.wait(timeout=poll_interval):
+            return
+
+
+def _worker_run(lock, running, dropbox_root, raw_cache_root, workdir_root):
+    with lock:
+        process_job(running, dropbox_root, raw_cache_root, workdir_root)
+
+
+# ---------------------------------------------------------------- spool lock
+@contextlib.contextmanager
+def spool_lock(spool_root):
+    """Hold an exclusive flock on <spool>/.daemon.lock for the duration."""
+    lock_path = os.path.join(spool_root, ".daemon.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            os.close(fd)
+            raise AlreadyRunning("another slacube-convertd instance is already running")
+        os.close(fd)
+        raise
+    try:
+        yield fd
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+# ---------------------------------------------------------------- install / uninstall
+SYSTEMD_UNIT_NAME = "slacube-convert.service"
+
+UNIT_TEMPLATE = """[Unit]
+Description=slacube conversion daemon
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c 'source {site_file} && exec slacube-convertd serve'
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def _unit_dir():
+    """Return the systemd --user unit directory, honoring $XDG_CONFIG_HOME."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return os.path.join(xdg, "systemd", "user")
+    return os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+
+
+def _site_file():
+    return os.environ.get("SLACUBE_SITE_FILE") or os.path.expanduser("~/.slacube-site.sh")
+
+
+def install_unit():
+    """Write the systemd --user unit file."""
+    unit_dir = _unit_dir()
+    os.makedirs(unit_dir, exist_ok=True)
+    unit_path = os.path.join(unit_dir, SYSTEMD_UNIT_NAME)
+    content = UNIT_TEMPLATE.format(site_file=_site_file())
+    with open(unit_path, "w") as fh:
+        fh.write(content)
+    return unit_path
+
+
+def uninstall_unit():
+    """Remove the systemd --user unit file (no systemctl call)."""
+    unit_dir = _unit_dir()
+    unit_path = os.path.join(unit_dir, SYSTEMD_UNIT_NAME)
+    with contextlib.suppress(OSError):
+        os.remove(unit_path)
+
+
+def _run(cmd, check=True):
+    """Run a shell command, return (rc, stdout, stderr)."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = proc.communicate()
+    return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------- CLI
+def build_parser():
+    p = argparse.ArgumentParser(prog="slacube-convertd",
+                                description="SLACube conversion daemon CLI")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # serve
+    serve = sub.add_parser("serve", help="run the daemon loop")
+    serve.add_argument("--once", action="store_true",
+                       help="run a single poll-and-dispatch pass and exit (tests only)")
+
+    # status
+    status = sub.add_parser("status", help="print spool counts and exit with status code")
+    status.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
+    # submit
+    submit_p = sub.add_parser("submit", help="submit a raw file to the spool")
+    submit_p.add_argument("raw_path", help="absolute path to the raw .h5 file")
+
+    # retry
+    retry_p = sub.add_parser("retry", help="move a failed job back to incoming/")
+    retry_p.add_argument("job", help="job name (basename without .h5)")
+
+    # ack
+    ack_p = sub.add_parser("ack", help="move a failed job to done/ with outcome=acked")
+    ack_p.add_argument("job", help="job name (basename without .h5)")
+
+    # drain
+    sub.add_parser("drain", help="block until incoming/ and running/ are empty")
+
+    # install
+    sub.add_parser("install", help="write systemd --user unit and enable it")
+
+    # uninstall
+    sub.add_parser("uninstall", help="disable and remove systemd --user unit")
+
+    return p
+
+
+def cmd_serve(args, env):
+    spool = _require_env("SLACUBE_SPOOL")
+    dropbox = _require_env("SLACUBE_DROPBOX")
+    raw_cache = _require_env("SLACUBE_RAW_CACHE")
+    workdir = os.environ.get("SLACUBE_WORKDIR", os.path.dirname(spool))
+    with spool_lock(spool):
+        _serve_loop(spool, dropbox, raw_cache, workdir, once=args.once)
+
+
+def cmd_status(args, env):
+    spool = _require_env("SLACUBE_SPOOL")
+    s = compute_status(spool)
+    if args.json:
+        sys.stdout.write(json.dumps({
+            "pending": s["counts"]["pending"],
+            "running": s["counts"]["running"],
+            "failed": s["counts"]["failed"],
+            "done": s["counts"]["done"],
+            "consecutive_fail": s["consecutive_fail"],
+        }) + "\n")
+    else:
+        sys.stdout.write("pending=%d running=%d failed=%d done=%d consecutive_fail=%d\n" % (
+            s["counts"]["pending"], s["counts"]["running"],
+            s["counts"]["failed"], s["counts"]["done"],
+            s["consecutive_fail"],
+        ))
+    sys.exit(s["exit_code"])
+
+
+def cmd_submit(args, env):
+    spool = _require_env("SLACUBE_SPOOL")
+    dropbox = _require_env("SLACUBE_DROPBOX")
+    status, msg, _ = submit(args.raw_path, spool, dropbox)
+    if status == "duplicate":
+        sys.stdout.write(msg + "\n")
+        sys.exit(0)
+    if status == "unclassifiable":
+        sys.stderr.write(msg + "\n")
+        sys.exit(0)
+    sys.stdout.write(msg + "\n")
+    sys.exit(0)
+
+
+def cmd_retry(args, env):
+    spool = _require_env("SLACUBE_SPOOL")
+    try:
+        retry(spool, args.job)
+    except JobNotFound as exc:
+        sys.stderr.write("error: %s\n" % exc)
+        sys.exit(1)
+    sys.stdout.write("retried %s\n" % args.job)
+    sys.exit(0)
+
+
+def cmd_ack(args, env):
+    spool = _require_env("SLACUBE_SPOOL")
+    try:
+        ack(spool, args.job)
+    except JobNotFound as exc:
+        sys.stderr.write("error: %s\n" % exc)
+        sys.exit(1)
+    sys.stdout.write("acked %s\n" % args.job)
+    sys.exit(0)
+
+
+def cmd_drain(args, env):
+    spool = _require_env("SLACUBE_SPOOL")
+    if drain(spool):
+        sys.exit(0)
+    sys.stderr.write("drain timed out\n")
+    sys.exit(1)
+
+
+def cmd_install(args, env):
+    unit_path = install_unit()
+    sys.stdout.write("wrote %s\n" % unit_path)
+    rc, out, err = _run(["systemctl", "--user", "daemon-reload"])
+    if rc != 0:
+        sys.stderr.write("daemon-reload failed: %s\n" % err)
+    rc2, out2, err2 = _run(["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT_NAME])
+    if rc2 != 0:
+        sys.stderr.write("enable --now failed: %s\n" % err2)
+        sys.exit(rc2 or rc or 1)
+    sys.exit(0)
+
+
+def cmd_uninstall(args, env):
+    _run(["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT_NAME])
+    uninstall_unit()
+    sys.stdout.write("uninstalled\n")
+    sys.exit(0)
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    handlers = {
+        "serve": cmd_serve,
+        "status": cmd_status,
+        "submit": cmd_submit,
+        "retry": cmd_retry,
+        "ack": cmd_ack,
+        "drain": cmd_drain,
+        "install": cmd_install,
+        "uninstall": cmd_uninstall,
+    }
+    try:
+        handlers[args.command](args, os.environ)
+    except AlreadyRunning as exc:
+        sys.stderr.write("error: %s\n" % exc)
+        sys.exit(1)
+    except MissingEnv as exc:
+        sys.stderr.write("error: %s\n" % exc)
+        sys.exit(1)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""Test harness for bin/slacube-convertd.
+
+This is a standalone test driver (no pytest required). It exercises the
+daemon's importable library functions and the CLI subcommands against a
+synthetic filesystem layout, using a PATH-shadowing fake
+`slacube-convert-raw.py` so conversion does not require the real larpix
+toolchain.
+
+Run as:
+    python3 tests/test_slacube_convertd.py
+Exit code 0 on success, non-zero on failure.
+"""
+
+from __future__ import print_function
+
+import contextlib
+import errno
+import fcntl
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import time as _time
+from datetime import datetime
+
+# Load bin/slacube-convertd as a Python module (it has no .py extension).
+HERE = os.path.dirname(os.path.abspath(__file__))
+BIN_DIR = os.path.normpath(os.path.join(HERE, "..", "bin"))
+_CONVERTD_PATH = os.path.join(BIN_DIR, "slacube-convertd")
+import importlib.util as _importlib_util
+import importlib.machinery as _importlib_machinery
+_loader = _importlib_machinery.SourceFileLoader("slacube_convertd", _CONVERTD_PATH)
+_spec = _importlib_util.spec_from_loader("slacube_convertd", _loader)
+convertd = _importlib_util.module_from_spec(_spec)
+_loader.exec_module(convertd)
+
+
+# ---------------------------------------------------------------- helpers
+_failures = []
+
+
+def check(cond, msg):
+    if cond:
+        print("  PASS: " + msg)
+    else:
+        print("  FAIL: " + msg)
+        _failures.append(msg)
+
+
+@contextlib.contextmanager
+def tmp_layout():
+    root = tempfile.mkdtemp(prefix="slacube_test_")
+    spool = os.path.join(root, "spool")
+    dropbox = os.path.join(root, "dropbox")
+    raw_cache = os.path.join(root, "raw_cache")
+    workdir = os.path.join(root, "work")
+    for d in (spool, dropbox, raw_cache, workdir):
+        os.makedirs(d)
+    for sub in ("incoming", "running", "failed", "done"):
+        os.makedirs(os.path.join(spool, sub))
+    try:
+        yield {
+            "root": root,
+            "spool": spool,
+            "dropbox": dropbox,
+            "raw_cache": raw_cache,
+            "workdir": workdir,
+        }
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def write_fake_raw(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(b"FAKE_RAW\n")
+
+
+def install_fake_converter():
+    """Replace PATH's view of `slacube-convert-raw.py` with a script that
+    just copies input to output (or fails on demand). Returns (dir, env)."""
+    fake_dir = tempfile.mkdtemp(prefix="fake_conv_")
+    script = os.path.join(fake_dir, "slacube-convert-raw.py")
+    with open(script, "w") as fh:
+        fh.write(
+            "#!/usr/bin/env python3\n"
+            "import sys, shutil, os\n"
+            "args = sys.argv[1:]\n"
+            "inp = out = fail = None\n"
+            "i = 0\n"
+            "while i < len(args):\n"
+            "    a = args[i]\n"
+            "    if a in ('--input_filename', '-i'):\n"
+            "        inp = args[i+1]; i += 2\n"
+            "    elif a in ('--output_filename', '-o'):\n"
+            "        out = args[i+1]; i += 2\n"
+            "    elif a == '--fail':\n"
+            "        fail = True; i += 1\n"
+            "    else:\n"
+            "        i += 1\n"
+            "if fail:\n"
+            "    sys.stderr.write('forced fail\\n')\n"
+            "    sys.exit(1)\n"
+            "if not inp or not out:\n"
+            "    sys.exit(2)\n"
+            "os.makedirs(os.path.dirname(out), exist_ok=True)\n"
+            "shutil.copyfile(inp, out)\n"
+            "sys.exit(0)\n"
+        )
+    os.chmod(script, 0o755)
+    return fake_dir
+
+
+def run_cli(args, env_extra=None):
+    """Invoke `slacube-convertd` as a subprocess. Returns (rc, stdout, stderr)."""
+    env = os.environ.copy()
+    if env_extra:
+        env.update(env_extra)
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(BIN_DIR, "slacube-convertd")] + list(args),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    out, err = proc.communicate()
+    return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+
+# ============================================================== tests
+print("=" * 60)
+print("test_slacube_convertd")
+print("=" * 60)
+
+
+# ---------------------------------------------------------- classification
+print("\n[classification]")
+
+check(
+    convertd.classify_basename("raw_2026_02_21_21_52_18.h5") == "selftrigger_",
+    "raw_*.h5 -> selftrigger_",
+)
+check(
+    convertd.classify_basename("pedestal_2026_02_21_21_52_18.h5") == "pedestal_",
+    "pedestal_*.h5 -> pedestal_",
+)
+check(
+    convertd.classify_basename("selftrigger_2026_02_21_21_52_18.h5") is None,
+    "selftrigger_*.h5 -> None (already converted)",
+)
+check(
+    convertd.classify_basename("garbage.h5") is None,
+    "garbage.h5 -> None (unclassifiable)",
+)
+
+yr, dt = convertd.parse_year_date("raw_2026_02_21_21_52_18.h5")
+check(yr == "2026" and dt == "2026-02-21", "parse year/date from raw_2026_02_21_21_52_18.h5")
+
+# ---------------------------------------------------------- submit / dedup
+print("\n[submit & dedup]")
+
+with tmp_layout() as L:
+    raw = os.path.join(L["workdir"], "raw_2026_02_21_21_52_18.h5")
+    write_fake_raw(raw)
+
+    status, msg, out = convertd.submit(raw, L["spool"], L["dropbox"])
+    check(status == "ok", "submit returns ok for new raw: %r" % ((status, msg, out),))
+    job_name = "raw_2026_02_21_21_52_18"
+    check(
+        os.path.isfile(os.path.join(L["spool"], "incoming", job_name + ".json")),
+        "incoming/<job>.json was written",
+    )
+    with open(os.path.join(L["spool"], "incoming", job_name + ".json")) as fh:
+        rec = json.load(fh)
+    check(rec["raw"] == raw, "record.raw == submitted path")
+    check(rec["attempts"] == 0, "record.attempts == 0")
+    check(rec["out"].endswith("selftrigger_2026_02_21_21_52_18.h5"), "record.out ends with selftrigger_*")
+    check(rec["out"].startswith(L["dropbox"]), "record.out lands under dropbox")
+
+    # Duplicate
+    status2, msg2, _ = convertd.submit(raw, L["spool"], L["dropbox"])
+    check(status2 == "duplicate", "submit returns duplicate for resubmit: %r" % (msg2,))
+
+# ---------------------------------------------------------- unclassifiable
+print("\n[unclassifiable basename]")
+with tmp_layout() as L:
+    raw = os.path.join(L["workdir"], "garbage.h5")
+    write_fake_raw(raw)
+    status, msg, out = convertd.submit(raw, L["spool"], L["dropbox"])
+    check(status == "unclassifiable", "submit returns unclassifiable for garbage.h5: %r" % (msg,))
+    job_name = "garbage"
+    check(
+        os.path.isfile(os.path.join(L["spool"], "failed", job_name + ".json")),
+        "unclassifiable job lands in failed/ immediately",
+    )
+    with open(os.path.join(L["spool"], "failed", job_name + ".json")) as fh:
+        rec = json.load(fh)
+    check(rec.get("last_error") == "unclassifiable", "unclassifiable record has last_error='unclassifiable'")
+
+# ---------------------------------------------------------- status counts
+print("\n[status & exit codes]")
+with tmp_layout() as L:
+    s = convertd.compute_status(L["spool"], max_consecutive=3)
+    check(s["counts"]["pending"] == 0 and s["counts"]["running"] == 0
+          and s["counts"]["failed"] == 0 and s["counts"]["done"] == 0,
+          "empty spool: all counts zero: %r" % (s,))
+    check(s["consecutive_fail"] == 0, "empty spool: consecutive_fail == 0")
+    check(s["exit_code"] == 0, "empty spool: exit_code == 0")
+
+    # Add an unclassifiable -> 1 failed
+    raw = os.path.join(L["workdir"], "garbage.h5")
+    write_fake_raw(raw)
+    convertd.submit(raw, L["spool"], L["dropbox"])
+    s = convertd.compute_status(L["spool"], max_consecutive=3)
+    check(s["counts"]["failed"] == 1, "1 failed: failed count == 1: %r" % (s,))
+    check(s["consecutive_fail"] == 1, "1 failed, 0 done: consecutive_fail == 1")
+    check(s["exit_code"] == 2, "1 failed but below threshold: exit_code == 2")
+
+    # Add 2 more failures -> 3 total, threshold reached
+    for nm in ("raw_a", "raw_b"):
+        rec = {
+            "raw": "/nonexistent/raw_" + nm + ".h5",
+            "submitted": "2026-02-21T00:00:00",
+            "attempts": 3,
+            "not_before": None,
+            "last_error": "boom",
+            "pid": None,
+            "started": None,
+            "finished": "2026-02-21T00:00:10",
+            "duration_s": 1.0,
+            "out": "/tmp/out_" + nm + ".h5",
+        }
+        convertd.atomic_write_json(os.path.join(L["spool"], "failed", nm + ".json"), rec)
+    s = convertd.compute_status(L["spool"], max_consecutive=3)
+    check(s["counts"]["failed"] == 3, "3 failed total: %r" % (s,))
+    check(s["consecutive_fail"] == 3, "3 failed consecutive (no done): consecutive_fail == 3")
+    check(s["exit_code"] == 1, "consecutive_fail >= threshold: exit_code == 1")
+
+    # Add a done record older than all the failures
+    done_rec = {
+        "raw": "/none/raw_old.h5",
+        "submitted": "2026-01-01T00:00:00",
+        "attempts": 0,
+        "not_before": None,
+        "last_error": None,
+        "pid": None,
+        "started": None,
+        "finished": "2026-01-01T00:00:10",
+        "duration_s": 1.0,
+        "out": "/tmp/out_old.h5",
+    }
+    convertd.atomic_write_json(os.path.join(L["spool"], "done", "raw_old.json"), done_rec)
+    s = convertd.compute_status(L["spool"], max_consecutive=3)
+    # All 3 failures are newer than the done record -> consecutive_fail still 3
+    check(s["consecutive_fail"] == 3, "failures newer than done: consecutive_fail still 3")
+
+    # Add a newer done record -> resets consecutive_fail to 0
+    done_rec2 = dict(done_rec)
+    done_rec2["finished"] = "2030-01-01T00:00:10"
+    convertd.atomic_write_json(os.path.join(L["spool"], "done", "raw_new.json"), done_rec2)
+    s = convertd.compute_status(L["spool"], max_consecutive=3)
+    check(s["consecutive_fail"] == 0, "done newer than all failed: consecutive_fail == 0")
+    check(s["exit_code"] == 2, "failed non-empty but no consecutive failures: exit_code == 2")
+
+
+# ---------------------------------------------------------- claim
+print("\n[claim]")
+with tmp_layout() as L:
+    raw = os.path.join(L["workdir"], "raw_2026_02_21_21_52_18.h5")
+    write_fake_raw(raw)
+    convertd.submit(raw, L["spool"], L["dropbox"])
+    claimed = convertd.claim_job(L["spool"], "raw_2026_02_21_21_52_18")
+    check(claimed == os.path.join(L["spool"], "running", "raw_2026_02_21_21_52_18.json"),
+          "claim moves incoming -> running: %r" % (claimed,))
+    # Second claim returns None
+    again = convertd.claim_job(L["spool"], "raw_2026_02_21_21_52_18")
+    check(again is None, "second claim returns None")
+
+# ---------------------------------------------------------- process happy
+print("\n[process happy path]")
+with tmp_layout() as L:
+    fake_dir = install_fake_converter()
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = fake_dir + os.pathsep + saved_path
+    try:
+        raw = os.path.join(L["workdir"], "raw_2026_02_21_21_52_18.h5")
+        write_fake_raw(raw)
+        convertd.submit(raw, L["spool"], L["dropbox"])
+        running = convertd.claim_job(L["spool"], "raw_2026_02_21_21_52_18")
+        outcome, rec = convertd.process_job(running, L["dropbox"], L["raw_cache"], L["workdir"])
+        check(outcome == "ok", "process returns ok: %r" % (outcome,))
+        # record moved to done/
+        check(os.path.isfile(os.path.join(L["spool"], "done", "raw_2026_02_21_21_52_18.json")),
+              "record moved to done/")
+        # converted file in dropbox
+        out_name = "selftrigger_2026_02_21_21_52_18.h5"
+        check(os.path.isfile(os.path.join(L["dropbox"], out_name)),
+              "converted file in dropbox: %s" % out_name)
+        # raw in cache under year/date
+        check(os.path.isfile(os.path.join(L["raw_cache"], "2026", "2026-02-21",
+                                          "raw_2026_02_21_21_52_18.h5")),
+              "raw in cache under 2026/2026-02-21/")
+        # no leftover .part
+        check(not any(n.startswith(".") for n in os.listdir(L["dropbox"])),
+              "no dotfiles in dropbox (no .part leftovers)")
+        # record has finished/duration_s
+        with open(os.path.join(L["spool"], "done", "raw_2026_02_21_21_52_18.json")) as fh:
+            done_rec = json.load(fh)
+        check(done_rec["finished"] is not None, "done record has finished: %r" % (done_rec["finished"],))
+        check(done_rec["duration_s"] is not None and done_rec["duration_s"] >= 0,
+              "done record has duration_s: %r" % (done_rec["duration_s"],))
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(fake_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------- process failure
+print("\n[process failure path (forced converter failure)]")
+with tmp_layout() as L:
+    fake_dir = install_fake_converter()
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = fake_dir + os.pathsep + saved_path
+    try:
+        # Force process_job to pass --fail
+        raw = os.path.join(L["workdir"], "raw_2026_02_21_21_52_18.h5")
+        write_fake_raw(raw)
+        convertd.submit(raw, L["spool"], L["dropbox"])
+        running = convertd.claim_job(L["spool"], "raw_2026_02_21_21_52_18")
+        # Use a wrapper that injects --fail
+        outcome, rec = convertd.process_job(
+            running, L["dropbox"], L["raw_cache"], L["workdir"],
+            extra_args=["--fail"],
+        )
+        check(outcome == "fail", "process returns fail when converter exits 1: %r" % (outcome,))
+        # raw untouched
+        check(os.path.isfile(raw), "raw is untouched after failure")
+        # .part files cleaned
+        check(not any(n.startswith(".") for n in os.listdir(os.path.dirname(raw))),
+              "no .part leftovers in raw's directory")
+        check(not os.path.isfile(os.path.join(L["dropbox"], ".selftrigger_2026_02_21_21_52_18.h5.part")),
+              "no .part in dropbox after failure")
+        # record moved to incoming/ with attempts incremented (D2 retry path)
+        incoming_path = os.path.join(L["spool"], "incoming", "raw_2026_02_21_21_52_18.json")
+        check(os.path.isfile(incoming_path), "failed-but-retryable record moved to incoming/")
+        check(not os.path.isfile(running), "running/ record removed on retry path")
+        with open(incoming_path) as fh:
+            rec_running = json.load(fh)
+        check(rec_running["attempts"] == 1, "attempts incremented: %r" % (rec_running["attempts"],))
+        check(rec_running["last_error"] not in (None, ""), "last_error set: %r" % (rec_running["last_error"],))
+        check(rec_running["not_before"] is not None, "not_before set on retry: %r" % (rec_running["not_before"],))
+        check(rec_running["finished"] is None, "finished is None while still retrying")
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(fake_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------- attempts exhausted -> failed
+print("\n[attempts exhausted -> failed]")
+with tmp_layout() as L:
+    # Manually create a job at attempts == 2 so one more failure pushes it to failed/
+    rec = {
+        "raw": "/nonexistent/raw_2026_02_21_21_52_18.h5",
+        "submitted": "2026-02-21T00:00:00",
+        "attempts": 2,
+        "not_before": None,
+        "last_error": "previous",
+        "pid": None,
+        "started": None,
+        "finished": None,
+        "duration_s": None,
+        "out": os.path.join(L["dropbox"], "selftrigger_2026_02_21_21_52_18.h5"),
+    }
+    # Actually, process_job needs the raw file to exist for requeue etc. Use a real raw.
+    raw = os.path.join(L["workdir"], "raw_2026_02_21_21_52_18.h5")
+    write_fake_raw(raw)
+    rec["raw"] = raw
+    convertd.atomic_write_json(os.path.join(L["spool"], "running", "raw_2026_02_21_21_52_18.json"), rec)
+    fake_dir = install_fake_converter()
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = fake_dir + os.pathsep + saved_path
+    try:
+        running = os.path.join(L["spool"], "running", "raw_2026_02_21_21_52_18.json")
+        outcome, rec2 = convertd.process_job(
+            running, L["dropbox"], L["raw_cache"], L["workdir"],
+            extra_args=["--fail"],
+        )
+        check(outcome == "fail", "still fail outcome: %r" % (outcome,))
+        # After failure with attempts=2 -> exhausted -> moved to failed/
+        check(os.path.isfile(os.path.join(L["spool"], "failed", "raw_2026_02_21_21_52_18.json")),
+              "exhausted attempts -> record in failed/")
+        check(not os.path.isfile(os.path.join(L["spool"], "incoming", "raw_2026_02_21_21_52_18.json")),
+              "no record requeued to incoming/")
+        check(not os.path.isfile(os.path.join(L["spool"], "running", "raw_2026_02_21_21_52_18.json")),
+              "no record left in running/")
+        # raw untouched
+        check(os.path.isfile(raw), "raw untouched after attempts exhausted")
+        with open(os.path.join(L["spool"], "failed", "raw_2026_02_21_21_52_18.json")) as fh:
+            rec_failed = json.load(fh)
+        check(rec_failed["attempts"] == 3, "attempts == 3 (default max): %r" % (rec_failed["attempts"],))
+        check(rec_failed["finished"] is not None, "finished timestamp set")
+        check(rec_failed["duration_s"] is not None, "duration_s set")
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(fake_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------- crash recovery
+print("\n[crash recovery: re-queue running/ on daemon start]")
+with tmp_layout() as L:
+    raw = os.path.join(L["workdir"], "raw_2026_02_21_21_52_18.h5")
+    write_fake_raw(raw)
+    # Simulate: job in running/, attempts=0
+    rec = {
+        "raw": raw,
+        "submitted": "2026-02-21T00:00:00",
+        "attempts": 0,
+        "not_before": None,
+        "last_error": None,
+        "pid": 1234,
+        "started": "2026-02-21T00:00:01",
+        "finished": None,
+        "duration_s": None,
+        "out": os.path.join(L["dropbox"], "selftrigger_2026_02_21_21_52_18.h5"),
+    }
+    convertd.atomic_write_json(os.path.join(L["spool"], "running", "raw_2026_02_21_21_52_18.json"), rec)
+    # Simulate a leftover .part in dropbox
+    leftover = os.path.join(L["dropbox"], ".selftrigger_2026_02_21_21_52_18.h5.part")
+    open(leftover, "w").close()
+
+    convertd.requeue_running(L["spool"], L["workdir"])
+    check(os.path.isfile(os.path.join(L["spool"], "incoming", "raw_2026_02_21_21_52_18.json")),
+          "recovered job moved back to incoming/")
+    check(not os.path.isfile(os.path.join(L["spool"], "running", "raw_2026_02_21_21_52_18.json")),
+          "no record left in running/")
+    check(not os.path.exists(leftover), "leftover .part deleted")
+    with open(os.path.join(L["spool"], "incoming", "raw_2026_02_21_21_52_18.json")) as fh:
+        rec2 = json.load(fh)
+    check(rec2["attempts"] == 1, "attempts incremented: %r" % (rec2["attempts"],))
+    check(rec2["last_error"] == "interrupted", "last_error == 'interrupted'")
+
+
+# ---------------------------------------------------------- retry & ack
+print("\n[retry & ack]")
+with tmp_layout() as L:
+    raw = os.path.join(L["workdir"], "raw_2026_02_21_21_52_18.h5")
+    write_fake_raw(raw)
+    convertd.submit(raw, L["spool"], L["dropbox"])
+    # Move to failed by submitting unclassifiable
+    raw2 = os.path.join(L["workdir"], "garbage.h5")
+    write_fake_raw(raw2)
+    convertd.submit(raw2, L["spool"], L["dropbox"])  # ends in failed/
+
+    # retry: move failed/garbage.json -> incoming/garbage.json
+    convertd.retry(L["spool"], "garbage")
+    check(os.path.isfile(os.path.join(L["spool"], "incoming", "garbage.json")),
+          "retry moves failed -> incoming")
+    check(not os.path.isfile(os.path.join(L["spool"], "failed", "garbage.json")),
+          "retry removes from failed/")
+    with open(os.path.join(L["spool"], "incoming", "garbage.json")) as fh:
+        rec = json.load(fh)
+    check(rec["attempts"] == 0, "retry resets attempts to 0")
+    check(rec["last_error"] is None, "retry resets last_error to None")
+
+    # ack: failed job -> done with outcome=acked
+    raw3 = os.path.join(L["workdir"], "weird.h5")
+    write_fake_raw(raw3)
+    convertd.submit(raw3, L["spool"], L["dropbox"])  # goes to failed/
+    convertd.ack(L["spool"], "weird")
+    check(os.path.isfile(os.path.join(L["spool"], "done", "weird.json")),
+          "ack moves failed -> done")
+    with open(os.path.join(L["spool"], "done", "weird.json")) as fh:
+        rec = json.load(fh)
+    check(rec.get("outcome") == "acked", "ack adds outcome='acked'")
+
+
+# ---------------------------------------------------------- flock
+print("\n[flock exclusivity]")
+with tmp_layout() as L:
+    # Hold a lock manually
+    lock_path = os.path.join(L["spool"], ".daemon.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rc, _, err = run_cli(["serve", "--once"],
+                             env_extra={"SLACUBE_SPOOL": L["spool"]})
+        check(rc != 0, "second instance refused while flock held: rc=%d err=%r" % (rc, err))
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+# ---------------------------------------------------------- drain
+print("\n[drain]")
+with tmp_layout() as L:
+    # Initially empty: drain should return quickly
+    t0 = time.time()
+    convertd.drain(L["spool"], poll_interval=0.05, timeout=5.0)
+    elapsed = time.time() - t0
+    check(elapsed < 2.0, "drain on empty spool returns quickly (%.2fs)" % elapsed)
+
+
+# ---------------------------------------------------------- CLI: serve --once end-to-end
+print("\n[CLI: serve --once end-to-end]")
+with tmp_layout() as L:
+    fake_dir = install_fake_converter()
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = fake_dir + os.pathsep + saved_path
+    try:
+        raw = os.path.join(L["workdir"], "raw_2026_02_21_21_52_18.h5")
+        write_fake_raw(raw)
+        # Submit via CLI
+        rc, out, err = run_cli(
+            ["submit", raw],
+            env_extra={
+                "SLACUBE_SPOOL": L["spool"],
+                "SLACUBE_DROPBOX": L["dropbox"],
+                "SLACUBE_RAW_CACHE": L["raw_cache"],
+                "SLACUBE_WORKDIR": L["workdir"],
+            },
+        )
+        check(rc == 0, "CLI submit ok: rc=%d out=%r err=%r" % (rc, out, err))
+        # Serve --once
+        rc, out, err = run_cli(
+            ["serve", "--once"],
+            env_extra={
+                "SLACUBE_SPOOL": L["spool"],
+                "SLACUBE_DROPBOX": L["dropbox"],
+                "SLACUBE_RAW_CACHE": L["raw_cache"],
+                "SLACUBE_WORKDIR": L["workdir"],
+                "SLACUBE_CONVERT_POLL": "0.1",
+            },
+        )
+        check(rc == 0, "CLI serve --once ok: rc=%d out=%r err=%r" % (rc, out, err))
+        check(os.path.isfile(os.path.join(L["spool"], "done", "raw_2026_02_21_21_52_18.json")),
+              "after serve --once: record in done/")
+        check(os.path.isfile(os.path.join(L["dropbox"], "selftrigger_2026_02_21_21_52_18.h5")),
+              "after serve --once: converted file in dropbox")
+        check(os.path.isfile(os.path.join(L["raw_cache"], "2026", "2026-02-21",
+                                          "raw_2026_02_21_21_52_18.h5")),
+              "after serve --once: raw in cache")
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(fake_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------- CLI: status text and --json
+print("\n[CLI: status text and --json]")
+with tmp_layout() as L:
+    raw = os.path.join(L["workdir"], "raw_2026_02_21_21_52_18.h5")
+    write_fake_raw(raw)
+    convertd.submit(raw, L["spool"], L["dropbox"])
+
+    rc, out, err = run_cli(
+        ["status"],
+        env_extra={"SLACUBE_SPOOL": L["spool"],
+                   "SLACUBE_DROPBOX": L["dropbox"]},
+    )
+    # pending=1 running=0 failed=0 done=0
+    check(rc == 0, "status rc == 0 on pending-only: rc=%d out=%r" % (rc, out))
+    check("pending=1" in out, "status text contains pending=1: %r" % (out,))
+    check("running=0" in out, "status text contains running=0: %r" % (out,))
+    check("failed=0" in out, "status text contains failed=0: %r" % (out,))
+    check("done=0" in out, "status text contains done=0: %r" % (out,))
+    check("consecutive_fail=0" in out, "status text contains consecutive_fail=0: %r" % (out,))
+
+    rc, out, err = run_cli(
+        ["status", "--json"],
+        env_extra={"SLACUBE_SPOOL": L["spool"],
+                   "SLACUBE_DROPBOX": L["dropbox"]},
+    )
+    check(rc == 0, "status --json rc == 0")
+    j = json.loads(out)
+    check(j.get("pending") == 1, "status --json pending == 1: %r" % (j,))
+    check(j.get("running") == 0 and j.get("failed") == 0 and j.get("done") == 0,
+          "status --json other counts zero")
+    check(j.get("consecutive_fail") == 0, "status --json consecutive_fail == 0")
+
+
+# ---------------------------------------------------------- CLI: retry/ack/drain via subprocess
+print("\n[CLI: retry/ack/drain]")
+with tmp_layout() as L:
+    raw = os.path.join(L["workdir"], "raw_2026_02_21_21_52_18.h5")
+    write_fake_raw(raw)
+    # Inject a failed record directly via convertd module
+    convertd.atomic_write_json(os.path.join(L["spool"], "failed", "raw_2026_02_21_21_52_18.json"),
+                               {"raw": raw, "submitted": "2026-02-21T00:00:00",
+                                "attempts": 3, "not_before": None, "last_error": "x",
+                                "pid": None, "started": None, "finished": "2026-02-21T00:00:10",
+                                "duration_s": 1.0,
+                                "out": os.path.join(L["dropbox"], "selftrigger_2026_02_21_21_52_18.h5")})
+    rc, out, err = run_cli(["retry", "raw_2026_02_21_21_52_18"],
+                           env_extra={"SLACUBE_SPOOL": L["spool"]})
+    check(rc == 0 and os.path.isfile(os.path.join(L["spool"], "incoming",
+                                                  "raw_2026_02_21_21_52_18.json")),
+          "CLI retry moves failed -> incoming")
+
+    # Move it back to failed
+    os.rename(os.path.join(L["spool"], "incoming", "raw_2026_02_21_21_52_18.json"),
+              os.path.join(L["spool"], "failed", "raw_2026_02_21_21_52_18.json"))
+    rc, out, err = run_cli(["ack", "raw_2026_02_21_21_52_18"],
+                           env_extra={"SLACUBE_SPOOL": L["spool"]})
+    check(rc == 0 and os.path.isfile(os.path.join(L["spool"], "done",
+                                                  "raw_2026_02_21_21_52_18.json")),
+          "CLI ack moves failed -> done")
+
+
+# ---------------------------------------------------------- CLI: install/uninstall dry-run checks
+print("\n[CLI: install writes unit file with substituted site-file path]")
+with tmp_layout() as L:
+    rc, out, err = run_cli(
+        ["install"],
+        env_extra={
+            "HOME": L["root"],
+            "SLACUBE_SPOOL": L["spool"],
+            "SLACUBE_DROPBOX": L["dropbox"],
+            "XDG_CONFIG_HOME": os.path.join(L["root"], "xdg"),
+            "PATH": "/usr/bin:/bin",
+        },
+    )
+    # The unit-file write should succeed; systemctl calls may fail in this sandbox
+    # The actual path is printed to stdout as `wrote <path>`.
+    unit = None
+    for line in out.splitlines():
+        if line.startswith("wrote "):
+            unit = line[len("wrote "):].strip()
+            break
+    check(unit is not None and os.path.isfile(unit),
+          "install wrote unit file: %r (rc=%d err=%r)" % (unit, rc, err))
+    with open(unit) as fh:
+        content = fh.read()
+    check("slacube-convertd serve" in content, "unit file references slacube-convertd serve")
+    check("/.slacube-site.sh" in content, "unit file has default ~/.slacube-site.sh")
+
+
+# ---------------------------------------------------------- result
+print("\n" + "=" * 60)
+if _failures:
+    print("FAILED (%d):" % len(_failures))
+    for f in _failures:
+        print("  - " + f)
+    sys.exit(1)
+else:
+    print("ALL PASSED")
+    sys.exit(0)
