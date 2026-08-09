@@ -80,10 +80,16 @@ guard_acquisition()
   local poll=${SLACUBE_GUARD_POLL:-60}
   local max_hold=${SLACUBE_MAX_HOLD:-3600}
 
-  [[ -d "$SLACUBE_WORKDIR" ]] \
-    || { echo "guard: \$SLACUBE_WORKDIR not set or not a directory" >&2; return 2; }
-  [[ -d "$SLACUBE_DROPBOX" ]] \
-    || { echo "guard: \$SLACUBE_DROPBOX not set or not a directory" >&2; return 2; }
+  if [[ ! -d "$SLACUBE_WORKDIR" ]]; then
+    echo "guard: \$SLACUBE_WORKDIR not set or not a directory" >&2
+    echo 0 > .state 2>/dev/null || true
+    return 2
+  fi
+  if [[ ! -d "$SLACUBE_DROPBOX" ]]; then
+    echo "guard: \$SLACUBE_DROPBOX not set or not a directory" >&2
+    echo 0 > .state 2>/dev/null || true
+    return 2
+  fi
 
   local -i elapsed=0
   while :; do
@@ -111,17 +117,8 @@ guard_acquisition()
       # Hold: report free/backlog/quarantined/elapsed, sleep, re-check.
       # Backlog depth is best-effort: a missing convertd or empty spool
       # is treated as backlog=0 (still informative).
-      local status_json depth=0 quarantined=0 newest_q=""
-      status_json=$(slacube-convertd status --json 2>/dev/null || true)
-      if [[ -n "$status_json" ]]; then
-        depth=$(printf '%s' "$status_json" \
-          | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("pending",0)+d.get("running",0))' \
-            2>/dev/null || echo 0)
-        quarantined=$(printf '%s' "$status_json" \
-          | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("failed",0))' \
-            2>/dev/null || echo 0)
-      fi
-      echo "guard: workdir_free=${free_work}B dropbox_free=${free_drop}B backlog=${depth} quarantined=${quarantined} elapsed=${elapsed}s; waiting on free space"
+      _guard_status "$SLACUBE_SPOOL" || true
+      echo "guard: workdir_free=${free_work}B dropbox_free=${free_drop}B backlog=${BACKLOG_DEPTH} quarantined=${QUARANTINED_COUNT} elapsed=${elapsed}s; waiting on free space"
       sleep "$poll"
       elapsed=$((elapsed + poll))
       # Re-read free space now that we've slept.
@@ -157,39 +154,12 @@ guard_acquisition()
       free_drop=$free_drop2
     fi
 
-    # ---- rule 2 / 3 / 4: convertd status ----
-    local status_rc status_json depth=0 quarantined=0 newest_q=""
-    status_json=$(slacube-convertd status --json 2>/dev/null)
-    status_rc=$?
-    if [[ -n "$status_json" ]]; then
-      depth=$(printf '%s' "$status_json" \
-        | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("pending",0)+d.get("running",0))' \
-          2>/dev/null || echo 0)
-      quarantined=$(printf '%s' "$status_json" \
-        | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("failed",0))' \
-          2>/dev/null || echo 0)
-      # Newest quarantined job name: pick the lexicographically greatest
-      # failed/<job>.json (timestamp-sorted basenames sort chronologically).
-      newest_q=$(ls -1 "${SLACUBE_SPOOL}/failed" 2>/dev/null | sort | tail -1 || true)
-      newest_q=${newest_q%.json}
-    fi
-
-    # rule 3: consecutive failures (exit_code 1) -> STOP, not hold.
-    if (( status_rc == 1 )); then
-      echo "guard: convertd reports ${quarantined} consecutive failures (>= ${max_consec}); stopping" >&2
-      echo 0 > .state 2>/dev/null || true
-      return 1
-    fi
-
-    # rule 4: isolated failures (exit_code 2) -> warn, proceed.
-    if (( status_rc == 2 )); then
-      echo "guard: ${quarantined} quarantined job(s) in ${SLACUBE_SPOOL}/failed/ (newest: ${newest_q:-none}); proceeding"
-    fi
-
-    # rule 2: backlog hold, resume at <= MAX_BACKLOG/2.
+    # ---- rule 2: backlog hold, resume at <= MAX_BACKLOG/2.
+    _guard_status "$SLACUBE_SPOOL" || true
     local half=$((max_backlog / 2))
-    if (( depth > max_backlog )); then
-      echo "guard: backlog=${depth} > MAX_BACKLOG (${max_backlog}); waiting on backlog"
+    if (( BACKLOG_DEPTH > max_backlog )); then
+      # Hold: report free/backlog/quarantined/elapsed, sleep, re-check.
+      echo "guard: workdir_free=${free_work}B dropbox_free=${free_drop}B backlog=${BACKLOG_DEPTH} quarantined=${QUARANTINED_COUNT} elapsed=${elapsed}s; waiting on backlog"
       sleep "$poll"
       elapsed=$((elapsed + poll))
       if (( elapsed >= max_hold )); then
@@ -199,25 +169,26 @@ guard_acquisition()
       fi
       # Re-check backlog now that we've slept; resume only when it has
       # dropped to <= half the trigger threshold (hysteresis).
-      local status_json2 depth2
-      status_json2=$(slacube-convertd status --json 2>/dev/null)
-      if [[ -n "$status_json2" ]]; then
-        depth2=$(printf '%s' "$status_json2" \
-          | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("pending",0)+d.get("running",0))' \
-            2>/dev/null || echo "$depth")
-      else
-        depth2=$depth
-      fi
-      if (( depth2 > half )); then
+      _guard_status "$SLACUBE_SPOOL" || true
+      if (( BACKLOG_DEPTH > half )); then
         continue
       fi
       # depth has dropped enough; fall through to return 0.
     fi
 
-    # rule 5: max hold exceeded (only reachable if we held, slept, and
-    # then conditions cleared enough to fall out of the hold branches
-    # without crossing their own MAX_HOLD check; treat as defense in
-    # depth).
+    # ---- rule 3: consecutive failures (exit_code 1) -> STOP, not hold.
+    if (( CONVERTD_RC == 1 )); then
+      echo "guard: convertd reports ${CONSECUTIVE_FAILS} consecutive failures (>= ${max_consec}); stopping" >&2
+      echo 0 > .state 2>/dev/null || true
+      return 1
+    fi
+
+    # ---- rule 4: isolated failures (exit_code 2) -> warn, proceed.
+    if (( CONVERTD_RC == 2 )); then
+      echo "guard: ${QUARANTINED_COUNT} quarantined job(s) in ${SLACUBE_SPOOL}/failed/ (newest: ${NEWEST_QUARANTINED:-none}); proceeding"
+    fi
+
+    # ---- rule 5: max hold exceeded (defense in depth).
     if (( elapsed >= max_hold )); then
       echo "guard: held ${elapsed}s >= MAX_HOLD (${max_hold}); stopping" >&2
       echo 0 > .state 2>/dev/null || true
@@ -227,6 +198,86 @@ guard_acquisition()
     # All clear.
     return 0
   done
+}
+
+# _guard_status populates BACKLOG_DEPTH, QUARANTINED_COUNT,
+# CONSECUTIVE_FAILS, NEWEST_QUARANTINED, CONVERTD_RC by reading
+# `slacube-convertd status --json` and inspecting the failed/ spool
+# directory for the newest quarantined job. The helper is the single
+# source of truth for convertd-derived state; every rule in
+# guard_acquisition that needs spool status calls it.
+_guard_status()
+{
+  local spool="$1"
+  local status_json
+  status_json=$(slacube-convertd status --json 2>/dev/null)
+  CONVERTD_RC=$?
+  BACKLOG_DEPTH=0
+  QUARANTINED_COUNT=0
+  CONSECUTIVE_FAILS=0
+  NEWEST_QUARANTINED=""
+  if [[ -n "$status_json" ]]; then
+    read -r BACKLOG_DEPTH QUARANTINED_COUNT CONSECUTIVE_FAILS \
+      < <(printf '%s' "$status_json" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print(d.get("pending", 0) + d.get("running", 0),
+      d.get("failed", 0),
+      d.get("consecutive_fail", 0))
+' 2>/dev/null) || read -r BACKLOG_DEPTH QUARANTINED_COUNT CONSECUTIVE_FAILS \
+      < <(printf '0 0 0\n')
+  fi
+  # The daemon's `failed` field is the raw count of failed/ records.
+  # `consecutive_fail` is what the brief asks us to report. Pick the
+  # newest quarantined job by its `finished` timestamp, not by lex
+  # sort of the basename (which the brief's earlier implementation
+  # used). If parsing fails, fall back to the lexicographically
+  # greatest basename to keep some signal.
+  if [[ -d "$spool/failed" ]]; then
+    NEWEST_QUARANTINED=$(_newest_quarantined_job "$spool/failed")
+  fi
+  return 0
+}
+
+# _newest_quarantined_job <failed-dir>: prints the basename (without
+# `.json`) of the quarantined job with the latest `finished` timestamp.
+# If no record has a parseable timestamp, falls back to the
+# lexicographically greatest basename. Prints nothing when the
+# directory is empty.
+_newest_quarantined_job()
+{
+  local failed_dir="$1"
+  python3 - "$failed_dir" <<'PY'
+import os, sys, json, datetime
+d = sys.argv[1]
+best_name = None
+best_ts = None
+for n in os.listdir(d):
+    if not n.endswith(".json"):
+        continue
+    p = os.path.join(d, n)
+    try:
+        with open(p) as f:
+            rec = json.load(f)
+        ts = rec.get("finished")
+        if not ts:
+            continue
+        try:
+            cur = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            continue
+        if best_ts is None or cur > best_ts:
+            best_ts = cur
+            best_name = n
+    except (OSError, ValueError):
+        continue
+if best_name is None:
+    files = sorted(x for x in os.listdir(d) if x.endswith(".json"))
+    best_name = files[-1] if files else ""
+if best_name.endswith(".json"):
+    best_name = best_name[:-len(".json")]
+print(best_name)
+PY
 }
 
 show_help()
@@ -798,6 +849,7 @@ cmd_run()
 
       while [[ $(cat .state) -ne 0 ]]
       do
+        local -i n=0
         local tmp=$(mktemp -p tmp -d)
 
         python "${SLACUBE_QC_SCRIPTS}/pedestal_qc.py" \

@@ -13,13 +13,13 @@ DESCRIPTION
 COMMAND
 =======
 start [_ped-runtime_] [_selftrig-runtime_] [_selftrig-repeat_]
-::   Start the data-taking loop: one pedestal run followed by _selftrig-repeat_ self-triggered runs, repeated until stopped. Takes either zero arguments (all defaults) or exactly three. Defaults: `ped-runtime=120`, `selftrig-runtime=1200`, `selftrig-repeat=3` (seconds/count, as of 2023-04-10). Each self-trigger acquisition is preceded by `guard_acquisition` (see ENVIRONMENT) which holds the loop on backlog or low disk and stops it cleanly on consecutive convertd failures or a failed `df`.
+:   Start the data-taking loop: one pedestal run followed by _selftrig-repeat_ self-triggered runs, repeated until stopped. Takes either zero arguments (all defaults) or exactly three. Defaults: `ped-runtime=120`, `selftrig-runtime=1200`, `selftrig-repeat=3` (seconds/count, as of 2023-04-10).
 
 stop
-::   Stop the loop after the run in progress finishes.
+:   Stop the loop after the run in progress finishes.
 
 help
-::   Show this text.
+:   Show this text.
 
 EXAMPLES
 ========
@@ -41,13 +41,13 @@ Stop the loop
 ENVIRONMENT
 ===========
 `$SLACUBE_QC_SCRIPTS`
-::   Location of `pedestal_qc.py` and `selftrigger_qc.py`. See `slacube help`.
+:   Location of `pedestal_qc.py` and `selftrigger_qc.py`. See `slacube help`.
 
 `$SLACUBE_WORKDIR`
-::   Current working directory. See `slacube env help`.
+:   Current working directory. See `slacube env help`.
 
 `$SLACUBE_DROPBOX`
-::   Destination for pedestal output. Self-triggered raw output is submitted to `$SLACUBE_SPOOL` and converted/moved into `$SLACUBE_DROPBOX` by `slacube-convertd`. See `slacube help`.
+:   Destination for pedestal output. Self-triggered raw output is submitted to `$SLACUBE_SPOOL` and converted/moved into `$SLACUBE_DROPBOX` by `slacube-convertd`. See `slacube help`.
 
 `$SLACUBE_SPOOL`
 ::   Spool directory used by `slacube-convertd` to convert self-triggered data. See `slacube queue help`.

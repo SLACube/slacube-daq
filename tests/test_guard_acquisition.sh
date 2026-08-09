@@ -171,6 +171,16 @@ JSON
   done
 }
 
+# Seed one completed record with a chosen finished timestamp.
+seed_done() {
+  local spool="$1"
+  local name="$2"
+  local finished="$3"
+  cat > "$spool/done/${name}.json" <<JSON
+{"raw": "/scratch/slacube/work/${USER}/${name}.h5", "submitted": "2026-02-21T00:00:00", "attempts": 1, "not_before": null, "last_error": null, "pid": null, "started": "2026-02-21T00:00:00", "finished": "${finished}", "duration_s": 1.0, "out": "/data/slacube/dropbox/${name}.h5"}
+JSON
+}
+
 
 echo "============================================================"
 echo "test_guard_acquisition"
@@ -223,6 +233,50 @@ echo "$out"
 echo "$out" | grep -q '^rc=0$' && check 1 "backlog: rc==0 (held then resumed)" || check 0 "backlog: rc==0"
 assert "\"$elapsed\" -ge 2" "backlog: held at least 2s before resume (got ${elapsed}s)"
 assert "\"$elapsed\" -lt 15" "backlog: did not exceed MAX_HOLD (got ${elapsed}s)"
+echo "$out" | grep -q 'workdir_free=[0-9][0-9]*B' && check 1 "backlog: reports workdir free bytes" || check 0 "backlog: reports workdir free bytes"
+echo "$out" | grep -q 'dropbox_free=[0-9][0-9]*B' && check 1 "backlog: reports dropbox free bytes" || check 0 "backlog: reports dropbox free bytes"
+echo "$out" | grep -q 'backlog=9 quarantined=0 elapsed=0s; waiting on backlog' && check 1 "backlog: reports depth, quarantine, elapsed, and wait reason" || check 0 "backlog: reports complete hold context"
+
+
+wait "$drainer" 2>/dev/null || true
+rm -rf "$ROOT" "$fake_df"
+
+# ---------------------------------------------------------- backlog priority over failures
+echo
+echo "[priority: backlog hold precedes consecutive-failure stop]"
+eval "$(make_fixture)"
+seed_incoming "$SPOOL" 9
+seed_failed "$SPOOL" 3
+fake_df=$(make_fake_df "$WORKDIR" "$DROPBOX")
+cd "$WORKDIR"
+echo 1 > .state
+(
+  sleep 2
+  for f in "$SPOOL"/incoming/*.json; do mv "$f" "$SPOOL/done/"; done
+) &
+drainer=$!
+
+t0=$(date +%s)
+out=$(SLACUBE_SPOOL="$SPOOL" \
+SLACUBE_WORKDIR="$WORKDIR" \
+SLACUBE_DROPBOX="$DROPBOX" \
+SLACUBE_GUARD_POLL=1 \
+SLACUBE_MAX_BACKLOG=8 \
+SLACUBE_MAX_CONSECUTIVE_FAIL=3 \
+SLACUBE_MAX_HOLD=30 \
+PATH="$fake_df:$PATH" \
+  bash -c '
+    source "'"$BIN_DIR"'/slacube" >/dev/null 2>&1
+    guard_acquisition
+    echo "rc=$?"
+  ' 2>&1)
+t1=$(date +%s)
+elapsed=$((t1 - t0))
+echo "$out"
+first_guard=$(printf '%s\n' "$out" | grep '^guard:' | sed -n '1p')
+echo "$first_guard" | grep -q 'waiting on backlog' && check 1 "priority: backlog is handled before consecutive failures" || check 0 "priority: backlog is handled first"
+assert "\"$elapsed\" -ge 2" "priority: backlog held before failure stop (got ${elapsed}s)"
+echo "$out" | grep -q '^rc=[1-9]' && check 1 "priority: stops after backlog clears and failures remain" || check 0 "priority: eventual failure stop"
 
 wait "$drainer" 2>/dev/null || true
 rm -rf "$ROOT" "$fake_df"
@@ -302,7 +356,8 @@ rm -rf "$ROOT" "$fake_df"
 echo
 echo "[consecutive failures (exit_code 1): stops, not holds]"
 eval "$(make_fixture)"
-seed_failed "$SPOOL" 3
+seed_failed "$SPOOL" 4
+seed_done "$SPOOL" "newer_success" "2026-02-21T00:01:01"
 cd "$WORKDIR"
 echo 1 > .state
 fake_df=$(make_fake_df "$WORKDIR" "$DROPBOX")
@@ -312,7 +367,7 @@ out=$(SLACUBE_SPOOL="$SPOOL" \
 SLACUBE_WORKDIR="$WORKDIR" \
 SLACUBE_DROPBOX="$DROPBOX" \
 SLACUBE_GUARD_POLL=1 \
-SLACUBE_MAX_CONSECUTIVE_FAIL=3 \
+SLACUBE_MAX_CONSECUTIVE_FAIL=2 \
 PATH="$fake_df:$PATH" \
   bash -c '
     source "'"$BIN_DIR"'/slacube" >/dev/null 2>&1
@@ -320,13 +375,19 @@ PATH="$fake_df:$PATH" \
     rc=$?
     echo "rc=$rc"
     echo "state=$(cat .state 2>/dev/null)"
-  ')
+  ' 2>&1)
 t1=$(date +%s)
 elapsed=$((t1 - t0))
 echo "$out"
 echo "$out" | grep -q '^rc=[1-9]' && check 1 "stop-on-fail: rc!=0" || check 0 "stop-on-fail: rc!=0"
 echo "$out" | grep -q '^state=0$' && check 1 "stop-on-fail: .state=0" || check 0 "stop-on-fail: .state=0"
 assert "\"$elapsed\" -lt 3" "stop-on-fail: did not hold (elapsed=${elapsed}s)"
+echo "$out" | grep -q 'reports 2 consecutive failures' && check 1 "stop-on-fail: reports consecutive_fail, not total quarantined" || check 0 "stop-on-fail: reports consecutive_fail"
+if echo "$out" | grep -q 'reports 4 consecutive failures'; then
+  check 0 "stop-on-fail: does not label all quarantined jobs consecutive"
+else
+  check 1 "stop-on-fail: does not label all quarantined jobs consecutive"
+fi
 
 rm -rf "$ROOT" "$fake_df"
 
@@ -357,6 +418,53 @@ echo "$out" | grep -q '^rc=0$' && check 1 "isolated: rc==0 (proceeds)" || check 
 echo "$out" | grep -q '^state=1$' && check 1 "isolated: .state unchanged (still 1)" || check 0 "isolated: .state unchanged"
 
 rm -rf "$ROOT" "$fake_df"
+
+# ---------------------------------------------------------- newest quarantined by timestamp
+echo
+echo "[isolated failures: newest quarantine is selected by finished timestamp]"
+eval "$(make_fixture)"
+cat > "$SPOOL/failed/zzz_old.json" <<JSON
+{"raw": "/scratch/zzz_old.h5", "submitted": "2026-02-21T00:00:00", "attempts": 3, "not_before": null, "last_error": "old", "pid": null, "started": "2026-02-21T00:00:00", "finished": "2026-02-21T00:01:00", "duration_s": 1.0, "out": null}
+JSON
+cat > "$SPOOL/failed/aaa_new.json" <<JSON
+{"raw": "/scratch/aaa_new.h5", "submitted": "2026-02-21T00:00:00", "attempts": 3, "not_before": null, "last_error": "new", "pid": null, "started": "2026-02-21T00:00:00", "finished": "2026-02-21T00:02:00", "duration_s": 1.0, "out": null}
+JSON
+cd "$WORKDIR"
+echo 1 > .state
+fake_df=$(make_fake_df "$WORKDIR" "$DROPBOX")
+
+out=$(SLACUBE_SPOOL="$SPOOL" \
+SLACUBE_WORKDIR="$WORKDIR" \
+SLACUBE_DROPBOX="$DROPBOX" \
+SLACUBE_MAX_CONSECUTIVE_FAIL=3 \
+PATH="$fake_df:$PATH" \
+  bash -c 'source "'"$BIN_DIR"'/slacube" >/dev/null 2>&1; guard_acquisition' 2>&1)
+echo "$out"
+echo "$out" | grep -q 'newest: aaa_new' && check 1 "isolated: newest job follows finished timestamp" || check 0 "isolated: newest job follows finished timestamp"
+
+rm -rf "$ROOT" "$fake_df"
+
+
+# ---------------------------------------------------------- invalid directory stops state
+echo
+echo "[configuration error: invalid directory clears acquisition state]"
+eval "$(make_fixture)"
+cd "$ROOT"
+echo 1 > .state
+out=$(SLACUBE_SPOOL="$SPOOL" \
+SLACUBE_WORKDIR="$ROOT/missing-workdir" \
+SLACUBE_DROPBOX="$DROPBOX" \
+  bash -c '
+    source "'"$BIN_DIR"'/slacube" >/dev/null 2>&1
+    guard_acquisition
+    echo "rc=$?"
+    echo "state=$(cat .state)"
+  ' 2>&1)
+echo "$out"
+echo "$out" | grep -q '^rc=2$' && check 1 "configuration: invalid workdir returns 2" || check 0 "configuration: invalid workdir returns 2"
+echo "$out" | grep -q '^state=0$' && check 1 "configuration: invalid workdir clears .state" || check 0 "configuration: invalid workdir clears .state"
+
+rm -rf "$ROOT"
 
 
 # ---------------------------------------------------------- df failure -> STOP
@@ -415,6 +523,89 @@ echo "$out" | grep -q '^rc=[1-9]' && check 1 "max-hold: rc!=0" || check 0 "max-h
 echo "$out" | grep -q '^state=0$' && check 1 "max-hold: .state=0" || check 0 "max-hold: .state=0"
 
 rm -rf "$ROOT" "$fake_df"
+
+
+# ---------------------------------------------------------- cmd_run repeat reset
+echo
+echo "[run loop: every pedestal cycle runs selftrig-repeat acquisitions]"
+eval "$(make_fixture)"
+fake_bin=$(mktemp -d /tmp/slacube_fake_run_XXXXXX)
+qc_dir="$ROOT/qc"
+cfg_dir="$ROOT/cfg"
+mkdir -p "$qc_dir" "$cfg_dir"
+touch "$ROOT/controller.json" "$ROOT/bad-channels.json"
+cat > "$WORKDIR/.slacuberc" <<RC
+CTRL_FILE $ROOT/controller.json
+BAD_CHANNEL_FILE $ROOT/bad-channels.json
+CFG_DIR $cfg_dir
+RC
+cat > "$fake_bin/python" <<'PY'
+#!/usr/bin/env bash
+script=${1##*/}
+shift
+outdir=""
+while (($#)); do
+  if [[ $1 == --outdir ]]; then outdir=$2; break; fi
+  shift
+done
+case "$script" in
+  pedestal_qc.py)
+    count_file="$SLACUBE_WORKDIR/pedestal-count"
+    count=$(cat "$count_file" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    echo "$count" > "$count_file"
+    touch "$outdir/pedestal-${count}.h5"
+    # Bound a regressed loop whose self-trigger counter never resets.
+    (( count < 3 )) || echo 0 > "$SLACUBE_WORKDIR/.state"
+    ;;
+  selftrigger_qc.py)
+    count_file="$SLACUBE_WORKDIR/selftrig-count"
+    count=$(cat "$count_file" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    echo "$count" > "$count_file"
+    touch "$outdir/raw_2026_02_21_21_52_$(printf '%02d' "$count").h5"
+    ;;
+esac
+PY
+chmod +x "$fake_bin/python"
+cat > "$fake_bin/slacube-convertd" <<'CONVERTD'
+#!/usr/bin/env bash
+case "$1" in
+  status)
+    echo '{"pending":0,"running":0,"failed":0,"done":0,"consecutive_fail":0}'
+    ;;
+  submit)
+    count_file="$SLACUBE_WORKDIR/submit-count"
+    count=$(cat "$count_file" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    echo "$count" > "$count_file"
+    (( count < 4 )) || echo 0 > "$SLACUBE_WORKDIR/.state"
+    ;;
+esac
+CONVERTD
+chmod +x "$fake_bin/slacube-convertd"
+
+out=$(SLACUBE_WORKDIR="$WORKDIR" \
+SLACUBE_DROPBOX="$DROPBOX" \
+SLACUBE_SPOOL="$SPOOL" \
+SLACUBE_QC_SCRIPTS="$qc_dir" \
+SLACUBE_MIN_FREE=0 \
+SLACUBE_MIN_FREE_DROPBOX=0 \
+SLACUBE_RESUME_FREE=0 \
+SLACUBE_RESUME_FREE_DROPBOX=0 \
+PATH="$fake_bin:$PATH" \
+  "$BIN_DIR/slacube" run start 0 0 2 2>&1)
+rc=$?
+echo "$out"
+assert "\"$rc\" -eq 0" "run-loop: command exits cleanly"
+pedestal_count=$(cat "$WORKDIR/pedestal-count" 2>/dev/null || echo 0)
+submit_count=$(cat "$WORKDIR/submit-count" 2>/dev/null || echo 0)
+raw_count=$(find "$WORKDIR/tmp" -name 'raw*.h5' -type f | wc -l)
+assert "\"$pedestal_count\" -eq 2" "run-loop: completed two outer pedestal cycles"
+assert "\"$submit_count\" -eq 4" "run-loop: each outer cycle submitted two self-trigger raws"
+assert "\"$raw_count\" -eq 4" "run-loop: submitted raws remain at recorded paths for asynchronous conversion"
+
+rm -rf "$ROOT" "$fake_bin"
 
 
 # ---------------------------------------------------------- result

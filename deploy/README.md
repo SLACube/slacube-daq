@@ -22,6 +22,15 @@ vendored into `<store>/ext/` (which carries only the interactive-UI
 binaries `fzf`/`mdcat`, copied in at deploy time — see "One-time setup"):
 
 - `git` — resolving refs and archiving each repo.
+- `nq` — the queue tool checked by `preflight` at `deploy.sh:177`
+  (`for bin in git nq`). `bin/slacube` no longer shells out to it
+  (Task 2 replaced the `nq slacube-convert-and-move $tmp` call with
+  the `slacube-convertd submit` driven pipeline), but the preflight
+  check was left in place out of scope and would fail on hosts
+  without `nq` until it is removed in a follow-up. Decision
+  (`task-002`, 2026-08-08): `nq` is a host-provided runtime
+  dependency, not vendored into `<store>/ext/`. Confirmed present
+  via `preflight`'s `command -v` check.
 - the target Python interpreter (`--python`, checked for `-x`, not
   installed by this tool).
 - `uv` — build-only, used to create the release venv (D6); not needed at

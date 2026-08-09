@@ -13,19 +13,19 @@ DESCRIPTION
 COMMAND
 =======
 start [_runtime_] [_trig_cycle_]
-::   Start the monitoring loop, taking one pedestal run of _runtime_ seconds with _trig_cycle_ periodic-trigger cycles, repeated until stopped, moving output to `$SLACUBE_DROPBOX`. Takes either zero arguments (defaults) or exactly two. Defaults: `runtime=600`, `trig_cycle=2000000` (as of 2023-04-10).
+:   Start the monitoring loop, taking one pedestal run of _runtime_ seconds with _trig_cycle_ periodic-trigger cycles, repeated until stopped, moving output to `$SLACUBE_DROPBOX`. Takes either zero arguments (defaults) or exactly two. Defaults: `runtime=600`, `trig_cycle=2000000` (as of 2023-04-10).
 
 stop
-::   Stop the loop after the run in progress finishes.
+:   Stop the loop after the run in progress finishes.
 
 analyze [_file_]
-::   Analyze one pedestal-monitor file with `analyze_ped_mon.py`, writing output under `./ped_mon`.
+:   Analyze one pedestal-monitor file with `analyze_ped_mon.py`, writing output under `./ped_mon`.
 
 plot [_dir_]
-::   Plot the accumulated analysis in _dir_ (default `./ped_mon`) with `plot_ped_mon.py`.
+:   Plot the accumulated analysis in _dir_ (default `./ped_mon`) with `plot_ped_mon.py`.
 
 help
-::   Show this text.
+:   Show this text.
 
 EXAMPLES
 ========
@@ -52,13 +52,13 @@ Plot the accumulated analysis in a non-default directory
 ENVIRONMENT
 ===========
 `$SLACUBE_QC_SCRIPTS`
-::   Location of `pedestal_qc.py`, `analyze_ped_mon.py`, and `plot_ped_mon.py`. See `slacube help`.
+:   Location of `pedestal_qc.py`, `analyze_ped_mon.py`, and `plot_ped_mon.py`. See `slacube help`.
 
 `$SLACUBE_WORKDIR`
-::   Current working directory. See `slacube env help`.
+:   Current working directory. See `slacube env help`.
 
 `$SLACUBE_DROPBOX`
-::   Destination for pedestal-monitor output. See `slacube help`.
+:   Destination for pedestal-monitor output. See `slacube help`.
 
 `$SLACUBE_SPOOL`
 ::   Spool directory used by `slacube-convertd` to convert data. `guard_acquisition` reads the spool's convertd status to gate the loop on backlog and quarantine depth. See `slacube queue help`.
