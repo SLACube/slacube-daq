@@ -770,6 +770,7 @@ case "$1" in
   cfg)         shift; cmd_cfg "$@"        ;;
   power)       shift; cmd_power "$@"      ;;
   queue)       shift; cmd_queue "$@"      ;;
+  help)        shift; show_help slacube   ;;
   *)           show_version               ;;
   esac
 # }}}

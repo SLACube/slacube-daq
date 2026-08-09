@@ -124,8 +124,14 @@ def classify_basename(basename):
 
     Returns the destination prefix (e.g. "selftrigger_") or None if the
     basename cannot be classified. Convention mirrors slacube-convert-and-move:
-    `raw_*` -> `selftrigger_*` and `pedestal_*` -> `pedestal_*` is preserved.
-    Anything else returns None.
+    `raw_*` -> `selftrigger_*` (the prefix is replaced, the tail after
+    the prefix is preserved) and `pedestal_*` -> `pedestal_*` (an
+    IDENTITY mapping: the prefix is preserved, the tail is preserved,
+    so the input and output basenames are identical). The pedestal_
+    identity mapping is intentional -- pedestal jobs share the same
+    spool as selftrigger jobs, and the converter is expected to
+    recognize `pedestal_*` inputs and emit a `pedestal_*` output
+    without renaming. Anything else returns None.
     """
     if basename.startswith("raw_"):
         return "selftrigger_"
@@ -454,9 +460,13 @@ def _parse_iso(s):
 
 
 def consecutive_failures(spool_root):
-    """Number of failed/ records whose `finished` is >= the newest done/ `finished`.
+    """Number of failed/ records whose `finished` is strictly newer than the
+    newest done/ `finished`.
 
-    If done/ is empty, returns the count of all failed/ records.
+    A failed record that ties the newest done/ `finished` does NOT count
+    (the done/ record was written after that failure occurred), so the
+    comparison is `>` rather than `>=`. If done/ is empty, returns the
+    count of all failed/ records.
     """
     failed = list_jobs(spool_root)["failed"]
     done = list_jobs(spool_root)["done"]
@@ -476,7 +486,7 @@ def consecutive_failures(spool_root):
     for p in failed:
         rec = read_json(p)
         ts = _parse_iso(rec.get("finished"))
-        if ts is None or ts >= newest_done_ts:
+        if ts is not None and ts > newest_done_ts:
             count += 1
     return count
 
@@ -581,55 +591,76 @@ def drain(spool_root, poll_interval=None, timeout=None):
         lists = list_jobs(spool_root)
         if not lists["incoming"] and not lists["running"]:
             return True
-        time.sleep(poll_interval)
-    return False
+
+def _now_in_window(not_before):
+    """True if `not_before` is None or already in the past.
+
+    Used by the dispatch loop to skip jobs whose exponential backoff
+    window has not yet elapsed. Compares naive UTC datetimes (matching
+    the ISO format produced by `_now_iso`).
+    """
+    target = _parse_iso(not_before)
+    if target is None:
+        return True
+    return datetime.utcnow() >= target
 
 
-# ---------------------------------------------------------------- serve loop
-def _serve_once(spool_root, dropbox_root, raw_cache_root, workdir_root,
-                converter=None, timeout=None, attempts_max=None):
-    """Run one poll-and-dispatch pass. Returns the number of jobs claimed."""
-    claimed = 0
+def _dispatch_pass(spool_root, dropbox_root, raw_cache_root, workdir_root,
+                   workers, sem, converter, timeout, attempts_max):
+    """Claim and dispatch up to `workers` jobs concurrently.
+
+    Each job is checked for `not_before`; jobs whose backoff window has
+    not yet elapsed are skipped (left in incoming/ for the next pass).
+    The semaphore caps in-flight `process_job` calls at `workers`; the
+    filesystem-level claim (os.rename) and atomic record writes provide
+    per-job state isolation without a global lock.
+    """
+    active = []
     for incoming in list_jobs(spool_root)["incoming"]:
+        rec = read_json(incoming)
+        if not _now_in_window(rec.get("not_before")):
+            continue
         job_name = job_name_from_record_path(incoming)
         running = claim_job(spool_root, job_name)
         if running is None:
             continue
-        claimed += 1
-        process_job(running, dropbox_root, raw_cache_root, workdir_root,
-                    converter=converter, timeout=timeout, attempts_max=attempts_max)
-    return claimed
+        t = threading.Thread(
+            target=_worker_run,
+            args=(sem, running, dropbox_root, raw_cache_root, workdir_root,
+                  converter, timeout, attempts_max),
+            daemon=True,
+        )
+        t.start()
+        active.append(t)
+    for t in active:
+        t.join()
 
 
 def _serve_loop(spool_root, dropbox_root, raw_cache_root, workdir_root,
-                workers=None, poll_interval=None, once=False, lock_fd=None):
-    """The daemon loop."""
+                workers=None, poll_interval=None, once=False, lock_fd=None,
+                converter=None, timeout=None, attempts_max=None):
+    """The daemon loop.
+
+    Concurrency model: a single `threading.Semaphore(workers)` caps the
+    number of in-flight `process_job` calls. There is no global lock
+    serializing the pipeline -- per-job state is isolated by os.rename
+    (the claim step) and by atomic_write_json (the per-record writes).
+    The semaphore is the only shared mutable resource.
+    """
     if workers is None:
         workers = int(os.environ.get("SLACUBE_CONVERT_WORKERS", str(DEFAULT_WORKERS)))
     if poll_interval is None:
         poll_interval = float(os.environ.get("SLACUBE_CONVERT_POLL", str(DEFAULT_POLL)))
+    if workers < 1:
+        workers = 1
+    sem = threading.Semaphore(workers)
 
     # Crash recovery on startup
     requeue_running(spool_root, workdir_root)
 
     if once:
-        # Single-pass: dispatch synchronously across `workers` worker threads
-        lock = threading.Lock()
-        active = []
-        for incoming in list_jobs(spool_root)["incoming"]:
-            job_name = job_name_from_record_path(incoming)
-            running = claim_job(spool_root, job_name)
-            if running is None:
-                continue
-            t = threading.Thread(
-                target=_worker_run,
-                args=(lock, running, dropbox_root, raw_cache_root, workdir_root),
-                daemon=True,
-            )
-            t.start()
-            active.append(t)
-        for t in active:
-            t.join()
+        _dispatch_pass(spool_root, dropbox_root, raw_cache_root, workdir_root,
+                       workers, sem, converter, timeout, attempts_max)
         return
 
     # Long-running loop
@@ -642,33 +673,25 @@ def _serve_loop(spool_root, dropbox_root, raw_cache_root, workdir_root,
     signal.signal(signal.SIGINT, _stop_handler)
 
     while not stop.is_set():
-        active = []
-        lock = threading.Lock()
-        for incoming in list_jobs(spool_root)["incoming"]:
-            job_name = job_name_from_record_path(incoming)
-            running = claim_job(spool_root, job_name)
-            if running is None:
-                continue
-            t = threading.Thread(
-                target=_worker_run,
-                args=(lock, running, dropbox_root, raw_cache_root, workdir_root),
-                daemon=True,
-            )
-            t.start()
-            active.append(t)
-        for t in active:
-            while t.is_alive():
-                if stop.wait(timeout=0.5):
-                    return
-            t.join()
+        _dispatch_pass(spool_root, dropbox_root, raw_cache_root, workdir_root,
+                       workers, sem, converter, timeout, attempts_max)
         if stop.wait(timeout=poll_interval):
             return
 
 
-def _worker_run(lock, running, dropbox_root, raw_cache_root, workdir_root):
-    with lock:
-        process_job(running, dropbox_root, raw_cache_root, workdir_root)
+def _worker_run(sem, running, dropbox_root, raw_cache_root, workdir_root,
+                converter, timeout, attempts_max):
+    """Acquire one slot from the worker semaphore, then run process_job.
 
+    The semaphore (not a lock) bounds in-flight `process_job` calls to
+    `SLACUBE_CONVERT_WORKERS`. process_job touches only per-job paths
+    (its own incoming/<job>.json record and its own part file), so no
+    extra per-job locking is required.
+    """
+    with sem:
+        process_job(running, dropbox_root, raw_cache_root, workdir_root,
+                    converter=converter, timeout=timeout,
+                    attempts_max=attempts_max)
 
 # ---------------------------------------------------------------- spool lock
 @contextlib.contextmanager
@@ -898,6 +921,14 @@ def main(argv=None):
         sys.exit(1)
     except MissingEnv as exc:
         sys.stderr.write("error: %s\n" % exc)
+        sys.exit(1)
+    except ConvertdError as exc:
+        sys.stderr.write("error: %s\n" % exc)
+        sys.exit(1)
+    except FileNotFoundError as exc:
+        # raised by _run (cmd_install / cmd_uninstall) when systemctl
+        # (or another helper binary) is missing on PATH
+        sys.stderr.write("error: required binary not found: %s\n" % exc)
         sys.exit(1)
     return 0
 

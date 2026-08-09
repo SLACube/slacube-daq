@@ -81,15 +81,67 @@ def write_fake_raw(path):
         fh.write(b"FAKE_RAW\n")
 
 
-def install_fake_converter():
+def install_fake_converter(sleep_seconds=0.0, counter_path=None):
     """Replace PATH's view of `slacube-convert-raw.py` with a script that
-    just copies input to output (or fails on demand). Returns (dir, env)."""
+    just copies input to output (or fails on demand, or sleeps).
+
+    `sleep_seconds` makes the fake converter sleep that long between
+    start and copyfile, so concurrent invocations can be observed by
+    timing or by a shared counter (see `counter_path`).
+
+    `counter_path`, if set, makes the fake converter on entry:
+      1. flock a single file at <counter_path>
+      2. read "in_flight peak"
+      3. write "in_flight+1 max(peak,in_flight+1)"
+      4. release the lock
+      then sleep, copy, and (before exit) repeat steps 1-4 decrementing
+    in_flight. Used by the concurrency test to prove peak in-flight count.
+
+    Returns the directory holding the fake script. The caller is
+    responsible for shutil.rmtree().
+    """
     fake_dir = tempfile.mkdtemp(prefix="fake_conv_")
     script = os.path.join(fake_dir, "slacube-convert-raw.py")
+    extra = ""
+    if counter_path:
+        # Single-file shared state: "in_flight peak". Atomically update
+        # both via flock + read + write + release.
+        extra = (
+            "import os as _os, fcntl as _fcntl\n"
+            "_ctr = %r\n"
+            "_fd = _os.open(_ctr, _os.O_CREAT | _os.O_RDWR, 0o644)\n"
+            "def _bump(delta):\n"
+            "    while True:\n"
+            "        try:\n"
+            "            _fcntl.flock(_fd, _fcntl.LOCK_EX)\n"
+            "            break\n"
+            "        except OSError:\n"
+            "            continue\n"
+            "    _os.lseek(_fd, 0, 0)\n"
+            "    _raw = _os.read(_fd, 1024).decode('utf-8', 'replace').strip()\n"
+            "    parts = _raw.split() if _raw else ['0', '0']\n"
+            "    cur = int(parts[0]); peak = int(parts[1])\n"
+            "    cur += delta\n"
+            "    if cur > peak:\n"
+            "        peak = cur\n"
+            "    _os.ftruncate(_fd, 0)\n"
+            "    _os.lseek(_fd, 0, 0)\n"
+            "    _os.write(_fd, ('%%d %%d\\n' %% (cur, peak)).encode('utf-8'))\n"
+            "    _fcntl.flock(_fd, _fcntl.LOCK_UN)\n"
+            "    return peak\n"
+            "_peak_observed = _bump(+1)\n"
+        ) % counter_path
+    sleep_block = ""
+    if sleep_seconds > 0:
+        sleep_block = "import time as _time\n_t0 = _time.time()\nwhile _time.time() - _t0 < %r: pass\n" % sleep_seconds
+    decrement = ""
+    if counter_path:
+        decrement = "_bump(-1)\n_os.close(_fd)\n"
     with open(script, "w") as fh:
         fh.write(
             "#!/usr/bin/env python3\n"
             "import sys, shutil, os\n"
+            + extra +
             "args = sys.argv[1:]\n"
             "inp = out = fail = None\n"
             "i = 0\n"
@@ -108,8 +160,10 @@ def install_fake_converter():
             "    sys.exit(1)\n"
             "if not inp or not out:\n"
             "    sys.exit(2)\n"
+            + sleep_block +
             "os.makedirs(os.path.dirname(out), exist_ok=True)\n"
             "shutil.copyfile(inp, out)\n"
+            + decrement +
             "sys.exit(0)\n"
         )
     os.chmod(script, 0o755)
@@ -634,6 +688,281 @@ with tmp_layout() as L:
         content = fh.read()
     check("slacube-convertd serve" in content, "unit file references slacube-convertd serve")
     check("/.slacube-site.sh" in content, "unit file has default ~/.slacube-site.sh")
+
+
+# ---------------------------------------------------------- concurrency (finding 2)
+# Submit N jobs with a slow converter; with workers=K, multiple jobs must
+# overlap. Verify via timing: K * sleep_time per job if serial, ~ sleep_time
+# total if fully concurrent.
+print("\n[concurrency: SLACUBE_CONVERT_WORKERS > 1 dispatches in parallel]")
+with tmp_layout() as L:
+    counter_path = os.path.join(L["root"], "ctr")
+    open(counter_path, "w").close()
+    n_jobs = 4
+    sleep_s = 0.5
+    fake_dir = install_fake_converter(sleep_seconds=sleep_s, counter_path=counter_path)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = fake_dir + os.pathsep + saved_path
+    try:
+        names = []
+        for i in range(n_jobs):
+            nm = "raw_2026_02_21_%02d_%02d_%02d" % (i, i, i)
+            raw = os.path.join(L["workdir"], nm + ".h5")
+            write_fake_raw(raw)
+            convertd.submit(raw, L["spool"], L["dropbox"])
+            names.append(nm)
+        workers = 4
+        t0 = time.time()
+        rc, out, err = run_cli(
+            ["serve", "--once"],
+            env_extra={
+                "SLACUBE_SPOOL": L["spool"],
+                "SLACUBE_DROPBOX": L["dropbox"],
+                "SLACUBE_RAW_CACHE": L["raw_cache"],
+                "SLACUBE_WORKDIR": L["workdir"],
+                "SLACUBE_CONVERT_WORKERS": str(workers),
+                "SLACUBE_CONVERT_POLL": "0.1",
+            },
+        )
+        elapsed = time.time() - t0
+        check(rc == 0, "serve --once with workers=%d ok: rc=%d err=%r" % (workers, rc, err))
+        # All jobs completed (sleep_s * n_jobs if fully serial -> ~2s).
+        # Fully parallel (workers == n_jobs) -> ~sleep_s -> ~0.5s.
+        serial_lower = sleep_s * n_jobs * 0.5  # halfway between serial and parallel
+        check(
+            elapsed < serial_lower,
+            "serve --once with %d workers of %d overlapping jobs finished in %.2fs (< %.2fs = half-serial lower bound)"
+            % (workers, n_jobs, elapsed, serial_lower),
+        )
+        # Peak concurrent counter from the fake converter: must reach >= 2.
+        with open(counter_path) as fh:
+            raw = fh.read().strip().split()
+        cur = int(raw[0]) if len(raw) >= 1 else 0
+        peak = int(raw[1]) if len(raw) >= 2 else 0
+        check(cur == 0, "all converter processes decremented before exit: cur=%d" % cur)
+        check(peak >= 2, "shared counter proves concurrency: peak=%d (>=2)" % peak)
+        # All jobs landed in done/
+        done_count = len([f for f in os.listdir(os.path.join(L["spool"], "done"))
+                          if f.endswith(".json")])
+        check(done_count == n_jobs,
+              "all %d jobs ended in done/ (got %d)" % (n_jobs, done_count))
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(fake_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------- workers cap
+# With workers=2 and 4 jobs each sleeping 0.5s, peak concurrent in-flight
+# converter calls must be <= 2 (the semaphore bounds concurrency).
+print("\n[concurrency: SLACUBE_CONVERT_WORKERS caps peak in-flight calls]")
+with tmp_layout() as L:
+    counter_path = os.path.join(L["root"], "ctr2")
+    open(counter_path, "w").close()
+    n_jobs = 4
+    sleep_s = 0.5
+    fake_dir = install_fake_converter(sleep_seconds=sleep_s, counter_path=counter_path)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = fake_dir + os.pathsep + saved_path
+    try:
+        for i in range(n_jobs):
+            nm = "raw_2026_03_21_%02d_%02d_%02d" % (i, i, i)
+            raw = os.path.join(L["workdir"], nm + ".h5")
+            write_fake_raw(raw)
+            convertd.submit(raw, L["spool"], L["dropbox"])
+        workers = 2
+        rc, out, err = run_cli(
+            ["serve", "--once"],
+            env_extra={
+                "SLACUBE_SPOOL": L["spool"],
+                "SLACUBE_DROPBOX": L["dropbox"],
+                "SLACUBE_RAW_CACHE": L["raw_cache"],
+                "SLACUBE_WORKDIR": L["workdir"],
+                "SLACUBE_CONVERT_WORKERS": str(workers),
+                "SLACUBE_CONVERT_POLL": "0.1",
+            },
+        )
+        check(rc == 0, "serve --once with workers=%d ok" % workers)
+        with open(counter_path) as fh:
+            raw = fh.read().strip().split()
+        cur = int(raw[0]) if len(raw) >= 1 else 0
+        peak = int(raw[1]) if len(raw) >= 2 else 0
+        check(
+            1 <= peak <= workers,
+            "peak concurrent calls within [1, workers]: peak=%d workers=%d" % (peak, workers),
+        )
+        check(cur == 0, "all converter processes decremented before exit: cur=%d" % cur)
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(fake_dir, ignore_errors=True)
+
+
+
+
+# ---------------------------------------------------------- not_before backoff (finding 3)
+# A failed job is moved to incoming/ with not_before set in the future.
+# A subsequent serve --once must NOT claim it. After waiting past
+# not_before, a subsequent serve --once MUST claim it.
+print("\n[not_before: failed job NOT reclaimed before backoff window]")
+with tmp_layout() as L:
+    fake_dir = install_fake_converter()
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = fake_dir + os.pathsep + saved_path
+    try:
+        # Submit + claim + force-fail so process_job writes
+        # rec.not_before = now + 2^1 = 2 minutes from now (default backoff).
+        raw = os.path.join(L["workdir"], "raw_2026_02_21_21_52_18.h5")
+        write_fake_raw(raw)
+        convertd.submit(raw, L["spool"], L["dropbox"])
+        running = convertd.claim_job(L["spool"], "raw_2026_02_21_21_52_18")
+        outcome, rec = convertd.process_job(
+            running, L["dropbox"], L["raw_cache"], L["workdir"],
+            extra_args=["--fail"],
+        )
+        check(outcome == "fail", "force-fail yields fail outcome")
+        # After failure with attempts=1, the job is requeued to incoming/
+        # with not_before set to now + 2 minutes.
+        inc_path = os.path.join(L["spool"], "incoming", "raw_2026_02_21_21_52_18.json")
+        check(os.path.isfile(inc_path), "failed-retryable record moved back to incoming/")
+        with open(inc_path) as fh:
+            rec = json.load(fh)
+        check(rec.get("not_before") is not None,
+              "not_before set on retry: %r" % (rec.get("not_before"),))
+        # First serve --once: job is in the backoff window -> NOT claimed
+        rc, out, err = run_cli(
+            ["serve", "--once"],
+            env_extra={
+                "SLACUBE_SPOOL": L["spool"],
+                "SLACUBE_DROPBOX": L["dropbox"],
+                "SLACUBE_RAW_CACHE": L["raw_cache"],
+                "SLACUBE_WORKDIR": L["workdir"],
+                "SLACUBE_CONVERT_WORKERS": "2",
+                "SLACUBE_CONVERT_POLL": "0.1",
+            },
+        )
+        check(rc == 0, "serve --once during backoff ok: rc=%d err=%r" % (rc, err))
+        check(
+            not os.path.isfile(os.path.join(L["spool"], "running", "raw_2026_02_21_21_52_18.json")),
+            "job not claimed (backoff window): no entry in running/",
+        )
+        check(
+            os.path.isfile(inc_path),
+            "job still in incoming/ after backoff-skipped dispatch",
+        )
+        check(
+            not os.path.isfile(os.path.join(L["spool"], "done", "raw_2026_02_21_21_52_18.json")),
+            "job not yet completed (backoff honored)",
+        )
+        # Now rewrite the record's not_before to a point in the past and
+        # re-run serve --once: the job MUST be claimed and completed.
+        with open(inc_path) as fh:
+            rec = json.load(fh)
+        rec["not_before"] = "2000-01-01T00:00:00"
+        convertd.atomic_write_json(inc_path, rec)
+        rc, out, err = run_cli(
+            ["serve", "--once"],
+            env_extra={
+                "SLACUBE_SPOOL": L["spool"],
+                "SLACUBE_DROPBOX": L["dropbox"],
+                "SLACUBE_RAW_CACHE": L["raw_cache"],
+                "SLACUBE_WORKDIR": L["workdir"],
+                "SLACUBE_CONVERT_WORKERS": "2",
+                "SLACUBE_CONVERT_POLL": "0.1",
+            },
+        )
+        check(rc == 0, "serve --once after backoff expired ok: rc=%d err=%r" % (rc, err))
+        check(
+            os.path.isfile(os.path.join(L["spool"], "done", "raw_2026_02_21_21_52_18.json")),
+            "job reclaimed after backoff window expired -> done/",
+        )
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(fake_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------- consecutive_failures > comparison (minor)
+# With one done record and one failed record that ties its finished
+# timestamp, the comparison must use '>' (newer than) so the failed
+# record does NOT count toward consecutive_fail.
+print("\n[consecutive_failures: uses '>' not '>=']")
+with tmp_layout() as L:
+    ts = "2026-02-21T00:00:10"
+    done_rec = {
+        "raw": "/none/raw_d.h5", "submitted": ts,
+        "attempts": 0, "not_before": None, "last_error": None,
+        "pid": None, "started": ts, "finished": ts, "duration_s": 0.0,
+        "out": "/tmp/out_d.h5",
+    }
+    failed_rec = {
+        "raw": "/none/raw_f.h5", "submitted": ts,
+        "attempts": 3, "not_before": None, "last_error": "boom",
+        "pid": None, "started": ts, "finished": ts, "duration_s": 0.0,
+        "out": "/tmp/out_f.h5",
+    }
+    convertd.atomic_write_json(os.path.join(L["spool"], "done", "raw_d.json"), done_rec)
+    convertd.atomic_write_json(os.path.join(L["spool"], "failed", "raw_f.json"), failed_rec)
+    s = convertd.compute_status(L["spool"], max_consecutive=3)
+    # The 'failed' finished equals (not strictly newer than) the done finished,
+    # so it should NOT count toward consecutive_fail. With the '>=' bug, the
+    # count would be 1; the corrected '>' gives 0.
+    check(s["consecutive_fail"] == 0,
+          "consecutive_fail == 0 when failed finished ties done finished: got %d"
+          % s["consecutive_fail"])
+    check(s["exit_code"] == 2,
+          "exit_code == 2 (failed non-empty, no consecutive failures): got %d"
+          % s["exit_code"])
+
+
+# ---------------------------------------------------------- clean error: missing raw (minor)
+# `submit <missing>` should print a clean error and exit 1 (was a Python
+# traceback before the fix).
+print("\n[CLI: submit missing raw -> clean error + exit 1]")
+with tmp_layout() as L:
+    rc, out, err = run_cli(
+        ["submit", "/no/such/raw.h5"],
+        env_extra={
+            "SLACUBE_SPOOL": L["spool"],
+            "SLACUBE_DROPBOX": L["dropbox"],
+        },
+    )
+    check(rc == 1, "submit missing raw exits 1: rc=%d err=%r" % (rc, err))
+    check("error:" in err and "not found" in err,
+          "submit missing raw prints clean error to stderr: %r" % (err,))
+
+
+# ---------------------------------------------------------- clean error: missing systemctl (minor)
+# `install` with an empty PATH should print a clean error and exit 1
+# (was an uncaught FileNotFoundError before the fix).
+print("\n[CLI: install with no systemctl -> clean error + exit 1]")
+with tmp_layout() as L:
+    empty_dir = tempfile.mkdtemp(prefix="empty_path_")
+    try:
+        rc, out, err = run_cli(
+            ["install"],
+            env_extra={
+                "HOME": L["root"],
+                "SLACUBE_SPOOL": L["spool"],
+                "SLACUBE_DROPBOX": L["dropbox"],
+                "XDG_CONFIG_HOME": os.path.join(L["root"], "xdg"),
+                "PATH": empty_dir,
+            },
+        )
+        check(rc == 1, "install with no systemctl exits 1: rc=%d" % rc)
+        check("error:" in err and "not found" in err,
+              "install with no systemctl prints clean error: %r" % (err,))
+    finally:
+        shutil.rmtree(empty_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------- _serve_once removed (minor)
+# The old `_serve_once` was dead code. Verify it's gone (replaced by
+# _dispatch_pass + _serve_loop).
+print("\n[cleanup: _serve_once removed]")
+check(not hasattr(convertd, "_serve_once"),
+      "_serve_once is gone (dead code removed)")
+check(hasattr(convertd, "_dispatch_pass"),
+      "_dispatch_pass exists (the new single-pass dispatcher)")
+check(hasattr(convertd, "_now_in_window"),
+      "_now_in_window exists (not_before helper)")
 
 
 # ---------------------------------------------------------- result
