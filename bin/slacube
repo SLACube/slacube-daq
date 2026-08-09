@@ -969,13 +969,35 @@ cmd_queue()
       ;;
   esac
 }
-# }}}
+
+cmd_stage()
+{
+  case "$1" in
+    help) shift; show_help stage ;;
+    *) slacube-stage "$@" ;;
+  esac
+}
+
+cmd_fsck()
+{
+  case "$1" in
+    help) shift; show_help fsck ;;
+    *) slacube-fsck "$@" ;;
+  esac
+}
+
+cmd_reap()
+{
+  case "$1" in
+    help) shift; show_help reap ;;
+    *) slacube-reap "$@" ;;
+  esac
+}
 # ====================================
-# main() {{{
-# ====================================
-# check workdir except running with no argument or "env,help,power,queue"
-# (queue works against the spool, not the workdir)
-[[ $# -eq 0 || "$1" == "env" || "$1" == "help" || "$1" == "power" || "$1" == "queue" || "$2" == "help" ]] || check_workdir
+# check workdir except running with no argument or for "env,help,power,
+# queue,stage,fsck,reap" (which operate on the dropbox/pool/raw-cache
+# directly and need not have a $SLACUBE_WORKDIR set).
+[[ $# -eq 0 || "$1" == "env" || "$1" == "help" || "$1" == "power" || "$1" == "queue" || "$1" == "stage" || "$1" == "fsck" || "$1" == "reap" || "$2" == "help" ]] || check_workdir
 
 case "$1" in
   env)         shift; cmd_env "$@"        ;;
@@ -991,6 +1013,9 @@ case "$1" in
   cfg)         shift; cmd_cfg "$@"        ;;
   power)       shift; cmd_power "$@"      ;;
   queue)       shift; cmd_queue "$@"      ;;
+  stage)       shift; cmd_stage "$@"      ;;
+  fsck)        shift; cmd_fsck "$@"       ;;
+  reap)        shift; cmd_reap "$@"       ;;
   help)        shift; show_help slacube   ;;
   *)           show_version               ;;
   esac

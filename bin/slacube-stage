@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""slacube-stage -- move converted files from $SLACUBE_DROPBOX into
+pool/<type>/<year>/<date>/ once they're at least 60 s old.
+
+This is the bridge between the conversion daemon's dropbox publish
+(small `*.h5` files under `$SLACUBE_DROPBOX`) and the long-term pool
+hierarchy under `dirname($SLACUBE_DROPBOX)/pool/`. Files younger than
+60 s are skipped (still being written by the converter, possibly
+`.part` siblings being renamed in). A basename whose type prefix is
+not recognised (``raw_``, anything not starting with ``selftrigger_``,
+``pedestal_``, or ``exttrig_``) is reported on stderr and the script
+exits non-zero after attempting every other file.
+
+Path classification and twin-check logic lives in
+``scripts/_slacube_paths.py``; this script imports it.
+
+Stdlib only (python3.8+); no third-party dependencies.
+"""
+
+from __future__ import print_function
+
+import argparse
+import os
+import sys
+import time
+
+# Make scripts/_slacube_paths.py importable without env.sh's PYTHONPATH
+# (this script must work from cron/systemd on a freshly deployed box as
+# well as from a unit-test harness that has not sourced the release env).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SCRIPTS = os.path.normpath(os.path.join(_HERE, "..", "scripts"))
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
+
+from _slacube_paths import stage_target_path  # noqa: E402
+
+
+# Files whose mtime is younger than this many seconds are left alone.
+# The 60 s window absorbs the rename-publish race with the converter:
+# the dropbox atomic publish (`.part` -> final) takes ~milliseconds,
+# but in pathological cases (NFS propagation, slow filesystem) the
+# kernel-side stat may briefly lag the rename by several seconds.
+MIN_AGE_SECONDS = 60
+
+
+def _die(msg):
+    sys.stderr.write("slacube-stage: " + msg + "\n")
+    sys.exit(2)
+
+
+def _file_age_seconds(path):
+    """Return seconds since the file was last modified."""
+    return max(0.0, time.time() - os.stat(path).st_mtime)
+
+
+def _iter_dropbox_files(dropbox_root):
+    """Yield (basename, full path) for every file in dropbox_root whose
+    basename matches `*.h5` and does not start with `.`. Sorted by name
+    for determinism (so test fixtures don't depend on directory
+    ordering).
+    """
+    for name in sorted(os.listdir(dropbox_root)):
+        full = os.path.join(dropbox_root, name)
+        if not os.path.isfile(full):
+            continue
+        if name.startswith("."):
+            continue
+        if not name.endswith(".h5"):
+            continue
+        yield name, full
+
+
+def stage_once(dropbox_root):
+    """Walk $SLACUBE_DROPBOX and rename every classifiable, mature file
+    into its pool bucket. Returns the number of unclassifiable files
+    encountered; the caller exits non-zero iff this count is non-zero.
+    """
+    if not os.path.isdir(dropbox_root):
+        _die("$SLACUBE_DROPBOX is not a directory: %s" % dropbox_root)
+
+    unclassifiable = []
+    staged = 0
+    for basename, full in _iter_dropbox_files(dropbox_root):
+        try:
+            age = _file_age_seconds(full)
+        except OSError as exc:
+            sys.stderr.write(
+                "slacube-stage: stat failed for %s: %s\n" % (full, exc))
+            continue
+        if age < MIN_AGE_SECONDS:
+            # Still being written by the converter; leave it.
+            continue
+        target = stage_target_path(dropbox_root, basename)
+        if target is None:
+            unclassifiable.append(basename)
+            continue
+        target_dir = os.path.dirname(target)
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            os.rename(full, target)
+            staged += 1
+        except OSError as exc:
+            sys.stderr.write(
+                "slacube-stage: rename %s -> %s failed: %s\n"
+                % (full, target, exc))
+            continue
+
+    for name in unclassifiable:
+        sys.stderr.write(
+            "slacube-stage: unclassifiable basename %r "
+            "(no recognised type prefix; not staged)\n" % name)
+    return len(unclassifiable)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="slacube-stage",
+        description=(
+            "Stage converted $SLACUBE_DROPBOX files into "
+            "pool/<type>/<year>/<date>/. Skips files younger than "
+            "%d s. Exits non-zero if any file is unclassifiable." %
+            MIN_AGE_SECONDS),
+    )
+    p.add_argument(
+        "--once", action="store_true",
+        help="(default behaviour) stage every file once and exit")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    _ = args  # reserved for future periodic-loop wiring
+    dropbox = os.environ.get("SLACUBE_DROPBOX")
+    if not dropbox:
+        _die("required env var $SLACUBE_DROPBOX is not set")
+    unclassifiable = stage_once(dropbox)
+    if unclassifiable:
+        sys.exit(1)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

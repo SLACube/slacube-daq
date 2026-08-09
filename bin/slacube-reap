@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""slacube-reap -- evict old raw files from $SLACUBE_RAW_CACHE once
+free space drops below SLACUBE_RAW_CACHE_LOW (default 500 GiB), until
+free space reaches SLACUBE_RAW_CACHE_HIGH (default 750 GiB).
+
+Eviction is oldest-mtime-first. A raw is deleted only if its
+converted twin exists in either $SLACUBE_DROPBOX or anywhere under
+`dirname($SLACUBE_DROPBOX)/pool/` (D1's invariant). A raw with no
+twin anywhere is logged and left in place, unconditionally -- even
+under capacity pressure. Twin-check logic is shared with
+`slacube-fsck` via `scripts/_slacube_paths.py`.
+
+Stdlib only (python3.8+); no third-party dependencies.
+"""
+
+from __future__ import print_function
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SCRIPTS = os.path.normpath(os.path.join(_HERE, "..", "scripts"))
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
+
+from _slacube_paths import (  # noqa: E402
+    has_converted_twin,
+    pool_root_for,
+)
+
+
+# Defaults per the spec (D3, D6). Absolute-byte watermarks; never
+# percentages.
+DEFAULT_LOW_BYTES = 500 * 1024 * 1024 * 1024
+DEFAULT_HIGH_BYTES = 750 * 1024 * 1024 * 1024
+
+# Poll interval (seconds) between re-checks of `df` once free space
+# dips below LOW. A small default keeps tests fast.
+DEFAULT_POLL = 5
+
+
+def _die(msg):
+    sys.stderr.write("slacube-reap: " + msg + "\n")
+    sys.exit(2)
+
+
+def _df_free_bytes(path):
+    """Parse `df --output=avail -B1 <path>` for free bytes. Returns
+    int or None on failure.
+
+    Robust against either the two-line form (header + value, as the
+    real `df` prints) or the bare-value form (as some PATH-shadowing
+    test fakes print): we always take the last non-empty line.
+    """
+    try:
+        out = subprocess.check_output(
+            ["df", "--output=avail", "-B1", path],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", "replace")
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+    if not lines:
+        return None
+    try:
+        return int(lines[-1])
+    except ValueError:
+        return None
+
+
+def _walk_raws(raw_cache_root):
+    """Yield (basename, full path, mtime) for every regular file under
+    the raw cache, sorted oldest-mtime-first.
+    """
+    entries = []
+    for dirpath, _dirs, files in os.walk(raw_cache_root):
+        for name in sorted(files):
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            if not os.path.isfile(full):
+                continue
+            entries.append((name, full, st.st_mtime))
+    entries.sort(key=lambda e: e[2])
+    return entries
+
+
+def _reap_once(raw_cache, dropbox, pool_root, low, high):
+    """Evict raws until free space reaches `high` (or all eligible
+    raws are gone). Returns (evicted_count, twinless_count).
+
+    Logs twin-less raws to stderr and skips them unconditionally.
+    """
+    free = _df_free_bytes(raw_cache)
+    if free is None:
+        sys.stderr.write(
+            "slacube-reap: df failed for %s; cannot check free space\n"
+            % raw_cache)
+        return 0, 0
+    if free >= low:
+        sys.stderr.write(
+            "slacube-reap: free=%d B >= LOW=%d B; nothing to do\n"
+            % (free, low))
+        return 0, 0
+
+    evicted = 0
+    twinless = 0
+    for basename, full, _mtime in _walk_raws(raw_cache):
+        # Re-check free space; we may have hit HIGH before exhausting
+        # the raw list.
+        cur = _df_free_bytes(raw_cache)
+        if cur is not None and cur >= high:
+            break
+        if not has_converted_twin(basename, dropbox, pool_root):
+            twinless += 1
+            sys.stderr.write(
+                "slacube-reap: raw %s has no converted twin in dropbox "
+                "or pool/; skipping (will not evict)\n" % full)
+            continue
+        try:
+            os.remove(full)
+            evicted += 1
+        except OSError as exc:
+            sys.stderr.write(
+                "slacube-reap: remove %s failed: %s\n" % (full, exc))
+    return evicted, twinless
+
+
+def reap_loop(raw_cache, dropbox, pool_root, low, high, poll,
+              once=False):
+    """Run the reap loop until free space reaches `high` (or no
+    eligible raws remain). If `once` is True, perform a single pass
+    and return regardless of free space (used by tests; production
+    callers without --once run in a loop until the watermark clears).
+    """
+    total_evicted = 0
+    total_twinless = 0
+    while True:
+        free = _df_free_bytes(raw_cache)
+        if free is None:
+            sys.stderr.write(
+                "slacube-reap: df failed for %s; exiting\n" % raw_cache)
+            break
+        if free >= low:
+            sys.stderr.write(
+                "slacube-reap: free=%d B >= LOW=%d B; stopping\n"
+                % (free, low))
+            break
+        evicted, twinless = _reap_once(
+            raw_cache, dropbox, pool_root, low, high)
+        total_evicted += evicted
+        total_twinless += twinless
+        # Check whether we hit HIGH or made no progress.
+        cur = _df_free_bytes(raw_cache)
+        if cur is not None and cur >= high:
+            sys.stderr.write(
+                "slacube-reap: free=%d B >= HIGH=%d B; stopping\n"
+                % (cur, high))
+            break
+        # No progress: either no raws at all, or only twin-less raws
+        # remain (which we refuse to evict). Either way, more passes
+        # will not free any bytes -- stop, even if free < HIGH.
+        if evicted == 0:
+            sys.stderr.write(
+                "slacube-reap: no eligible raws evicted in this "
+                "pass; stopping (twin-less raws may remain)\n")
+            break
+        if once:
+            break
+        time.sleep(poll)
+    return total_evicted, total_twinless
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="slacube-reap",
+        description=(
+            "Evict old raw files from $SLACUBE_RAW_CACHE once free "
+            "space drops below SLACUBE_RAW_CACHE_LOW (default %d GiB), "
+            "until free space reaches SLACUBE_RAW_CACHE_HIGH (default "
+            "%d GiB). Raws whose converted twin exists in dropbox or "
+            "pool/ are eligible; twin-less raws are never evicted." %
+            (DEFAULT_LOW_BYTES // (1024 ** 3),
+             DEFAULT_HIGH_BYTES // (1024 ** 3))))
+    p.add_argument(
+        "--once", action="store_true",
+        help="(default behaviour) reap until HIGH is reached and exit")
+    return p
+
+
+def _env_int(name, default):
+    val = os.environ.get(name)
+    if val is None or val == "":
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        sys.stderr.write(
+            "slacube-reap: %s=%r is not an integer; using default %d\n"
+            % (name, val, default))
+        return default
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    _ = args
+
+    raw_cache = os.environ.get("SLACUBE_RAW_CACHE")
+    dropbox = os.environ.get("SLACUBE_DROPBOX")
+    if not raw_cache:
+        _die("required env var $SLACUBE_RAW_CACHE is not set")
+    if not dropbox:
+        _die("required env var $SLACUBE_DROPBOX is not set")
+    if not os.path.isdir(raw_cache):
+        _die("$SLACUBE_RAW_CACHE is not a directory: %s" % raw_cache)
+
+    low = _env_int("SLACUBE_RAW_CACHE_LOW", DEFAULT_LOW_BYTES)
+    high = _env_int("SLACUBE_RAW_CACHE_HIGH", DEFAULT_HIGH_BYTES)
+    poll = _env_int("SLACUBE_REAP_POLL", DEFAULT_POLL)
+    if high <= low:
+        sys.stderr.write(
+            "slacube-reap: SLACUBE_RAW_CACHE_HIGH (%d) must exceed "
+            "SLACUBE_RAW_CACHE_LOW (%d); using HIGH=LOW+%d\n"
+            % (high, low, DEFAULT_HIGH_BYTES - DEFAULT_LOW_BYTES))
+        high = low + (DEFAULT_HIGH_BYTES - DEFAULT_LOW_BYTES)
+
+    pool_root = pool_root_for(dropbox)
+    evicted, twinless = reap_loop(
+        raw_cache, dropbox, pool_root, low, high, poll)
+    sys.stderr.write(
+        "slacube-reap: evicted=%d twin_less_skipped=%d\n"
+        % (evicted, twinless))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
