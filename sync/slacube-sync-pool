@@ -39,7 +39,9 @@
 # Exit codes:
 #   0  success (pulled, verified, delete-step completed as requested)
 #   1  any rsync step failed
-#   2  required env var missing or invalid (or unknown CLI flag)
+#   2  unknown CLI flag
+#      (SLACUBE_SYNC_SOURCE / SLACUBE_SYNC_DEST always have non-empty
+#      defaults, so a missing/invalid env var cannot reach this code)
 #
 # Stdlib only (bash); no new third-party dependencies.
 
@@ -58,7 +60,7 @@ for arg in "$@"; do
     --verbose)        VERBOSE=1 ;;
     --delete-source)  DELETE_SOURCE=1 ;;
     -h|--help)
-      sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -104,7 +106,7 @@ enumerate_source_files() {
         printf '%s\n' "$p"
       done
   else
-    local_root="${SOURCE%/}"
+    local local_root="${SOURCE%/}"
     prefix="$local_root/"
     find "$local_root" -type f -not -path '*/raw/*' -not -path '*/raw' \
       | while IFS= read -r p; do
@@ -120,11 +122,11 @@ enumerate_source_files() {
 resolve_source_path() {
   local rel="$1"
   if [[ "$SOURCE" == *:* ]]; then
-    ssh_root="${SOURCE#*:}"
+    local ssh_root="${SOURCE#*:}"
     ssh_root="${ssh_root%/}"
     printf '%s/%s' "$ssh_root" "$rel"
   else
-    local_root="${SOURCE%/}"
+    local local_root="${SOURCE%/}"
     printf '%s/%s' "$local_root" "$rel"
   fi
 }
@@ -133,6 +135,28 @@ resolve_source_path() {
 
 SOURCE="${SLACUBE_SYNC_SOURCE:-$DEFAULT_SOURCE}"
 DEST="${SLACUBE_SYNC_DEST:-$DEFAULT_DEST}"
+
+# Normalize SOURCE so it ALWAYS ends in exactly one trailing slash,
+# regardless of how the caller spelled SLACUBE_SYNC_SOURCE. The verify
+# pass's itemize output uses paths relative to SOURCE's contents, and
+# enumerate_source_files emits the same namespace. The two namespaces
+# agree only when SOURCE ends in '/'. If a caller supplies SOURCE
+# without a trailing slash, rsync's itemize output uses paths that
+# include the source directory's basename (e.g. `pool/...` for
+# `src/`, but `src/pool/...` for `src`), so every flagged_set lookup
+# would silently miss and --delete-source would happily delete a
+# flagged-differing file -- the one invariant this script must never
+# break. DEST is normalized for symmetry: it does not change rsync's
+# behavior for an existing destination, but it keeps every callsite
+# consistent and removes the foot-gun of "remember to add the slash".
+case "$SOURCE" in
+  */) ;;
+  *)  SOURCE="$SOURCE/" ;;
+esac
+case "$DEST" in
+  */) ;;
+  *)  DEST="$DEST/" ;;
+esac
 
 # --- step 1: pull -------------------------------------------------------
 
@@ -143,9 +167,10 @@ DEST="${SLACUBE_SYNC_DEST:-$DEFAULT_DEST}"
 # touches the legacy pool/raw/ tree.
 #
 # `rsync -i` is used so we can count how many files were actually
-# transferred (the parse: any line starting with `>f` or `>d` is a
-# file system-side transfer; entries for plain directories and total
-# summaries are ignored).
+# transferred (the parse: any line starting with `>f` is a regular-file
+# system-side transfer; entries for plain directories (`>d...`) and
+# total summaries are ignored because step 3 deletes regular files
+# only -- directory pruning is left for an explicit, later decision).
 if [[ "$VERBOSE" -eq 1 ]]; then
   log "pull: rsync -ai --exclude=raw $SOURCE $DEST"
 fi

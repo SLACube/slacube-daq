@@ -186,6 +186,45 @@ check $([[ -f "$SRC/pool/raw/selftrigger_2026_01_01_00_00_00.h5" ]] && echo 1 ||
 check $([[ -f "$SRC/pool/raw/some-other-thing.h5" ]] && echo 1 || echo 0) "--delete-source: raw/ preserved (other)"
 rm -rf "$ROOT"
 
+# ---------------------------------------------------------- SLACUBE_SYNC_SOURCE WITHOUT trailing slash
+echo
+echo "[no-trailing-slash: SLACUBE_SYNC_SOURCE without trailing slash still protects flagged file]"
+# Regression: enumerate_source_files derived relative paths by stripping
+# SOURCE's trailing slash, and flagged_set's keys come from rsync's
+# itemize output whose relative-path namespace only matches when SOURCE
+# ends in '/'. If SLACUBE_SYNC_SOURCE is set WITHOUT a trailing slash,
+# every flagged_set lookup silently misses, making every source file
+# (including genuinely flagged-differing ones) eligible for deletion
+# under --delete-source -- violating the invariant. Source MUST be
+# normalized so that --delete-source never deletes a flagged file.
+eval "$(make_fixture)"
+seed_pool_tree "$SRC"
+# Initial pull with trailing slash so files land at $DST/pool/...
+# (same setup as the other tests). The regression condition is the
+# NEXT invocation, which uses SLACUBE_SYNC_SOURCE WITHOUT a trailing
+# slash together with --delete-source.
+SLACUBE_SYNC_SOURCE="$SRC/" SLACUBE_SYNC_DEST="$DST" \
+  slacube-sync-pool >/dev/null 2>&1
+# Size-preserving corruption so rsync -a's size+mtime check does NOT
+# overwrite the corruption during the next pull; only the --checksum
+# verify step sees the difference.
+printf 'CORRUPT!' > "$DST/pool/selftrigger/2026/2026-08-01/selftrigger_2026_08_01_10_00_00.h5"
+touch -r "$SRC/pool/selftrigger/2026/2026-08-01/selftrigger_2026_08_01_10_00_00.h5" \
+  "$DST/pool/selftrigger/2026/2026-08-01/selftrigger_2026_08_01_10_00_00.h5"
+
+# NOTE: $SRC (no trailing slash) -- the regression condition.
+SLACUBE_SYNC_SOURCE="$SRC" \
+SLACUBE_SYNC_DEST="$DST" \
+  slacube-sync-pool --delete-source >/dev/null 2>&1
+rc=$?
+check $([[ $rc -eq 0 ]] && echo 1 || echo 0) "no-trailing-slash: --delete-source: exit 0"
+check $([[ -f "$SRC/pool/selftrigger/2026/2026-08-01/selftrigger_2026_08_01_10_00_00.h5" ]] && echo 1 || echo 0) "no-trailing-slash: flagged file retained in source"
+# Other verified files should still have been deleted (the fix must
+# not break the normal --delete-source path).
+check $([[ ! -e "$SRC/pool/selftrigger/2026/2026-08-01/selftrigger_2026_08_01_11_00_00.h5" ]] && echo 1 || echo 0) "no-trailing-slash: non-flagged file deleted from source"
+check $([[ -f "$SRC/pool/raw/selftrigger_2026_01_01_00_00_00.h5" ]] && echo 1 || echo 0) "no-trailing-slash: raw/ preserved"
+rm -rf "$ROOT"
+
 
 # ---------------------------------------------------------- --help shows default alias and usage
 echo
@@ -196,7 +235,6 @@ check $([[ $rc -eq 0 ]] && echo 1 || echo 0) "help: exit 0"
 echo "$out" | grep -q 'slacube-daq-pull' && check 1 "help: shows default alias slacube-daq-pull" || check 0 "help: shows default alias slacube-daq-pull"
 echo "$out" | grep -q 'SLACUBE_SYNC_SOURCE' && check 1 "help: mentions SLACUBE_SYNC_SOURCE env var" || check 0 "help: mentions SLACUBE_SYNC_SOURCE env var"
 echo "$out" | grep -q 'delete-source' && check 1 "help: mentions --delete-source flag" || check 0 "help: mentions --delete-source flag"
-rm -rf /tmp/slacube_sync_pool_test_noop 2>/dev/null || true
 
 
 # ---------------------------------------------------------- --verbose lists file-level detail
