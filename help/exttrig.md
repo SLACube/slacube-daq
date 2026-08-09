@@ -1,6 +1,6 @@
 NAME
 ====
-**slacube exttrig** - Script for taking data from external triggers.
+**slacube exttrig** - take data from external triggers
 
 SYNOPSIS
 ========
@@ -8,21 +8,21 @@ SYNOPSIS
 
 DESCRIPTION
 ===========
-**slacube exttrig** takes data from external triggers. It works under `$SLACUBE_WORKDIR`. The data-taking function is a wrapper of `exttrig.py`.
+**slacube exttrig** takes data from external triggers. It works under `$SLACUBE_WORKDIR` and requires `$CTRL_FILE` and `$BAD_CHANNEL_FILE` to already be set. The data-taking function is a wrapper of `exttrig.py`.
 
 COMMAND
 =======
 start [-h] [_OPTIONS_]
-:   Take a external trigger run. Default runtime is 30 seconds. See `exttrig.py -h` for additional _OPTIONS_.
+:   Take an external-trigger run. Default runtime is 30 seconds. See `exttrig.py -h` for additional _OPTIONS_.
 
 help
 :   Show this text.
 
 EXAMPLES
 ========
-Start a external triggered run for 1 mins
+Start an external-triggered run for 1 minute
 ```
-   $ slacube extrig start --runtime 60
+   $ slacube exttrig start --runtime 60
 ```
 
 ENVIRONMENT

@@ -1,6 +1,6 @@
 NAME
 ====
-**slacube power** - LArPix power management.
+**slacube power** - LArPix power management
 
 SYNOPSIS
 ========

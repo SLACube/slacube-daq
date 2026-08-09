@@ -1,6 +1,6 @@
 NAME
 ====
-**slacube ped-mon** - monitor pedestal for a long term.
+**slacube ped-mon** - monitor pedestal drift over long periods
 
 SYNOPSIS
 ========

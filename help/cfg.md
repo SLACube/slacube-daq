@@ -1,6 +1,6 @@
 NAME
 ====
-**slacube cfg** - manage run configuration.
+**slacube cfg** - manage run configuration
 
 SYNOPSIS
 ========
@@ -16,7 +16,7 @@ COMMAND
 :   Print every `SLACUBE_*` environment variable and `.slacuberc`.
 
 archive [_CONFIG_NAME_]
-:   Archive the active `$CFG_DIR`, `$CTRL_FILE`, and `$BAD_CHANNEL_FILE` into `$SLACUBE_GIT_DIR/configs/<year>/<date>__<name>`, then commit. Defaults _CONFIG_NAME_ to the basename of `$CFG_DIR`. Prompts for author name and a one-line comment, then confirms before committing. Fails if that name is already archived on that date.
+:   Archive the active `$CFG_DIR`, `$CTRL_FILE`, and `$BAD_CHANNEL_FILE` into `$SLACUBE_GIT_DIR/configs/<year>/<date>__<name>`, then commit. All three, plus `$SLACUBE_GIT_DIR`, must already be set. Defaults _CONFIG_NAME_ to the basename of `$CFG_DIR`. Prompts for author name and a one-line comment, then confirms before committing. Fails if that name is already archived on that date.
 
 help
 :   Show this text.

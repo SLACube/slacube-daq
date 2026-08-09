@@ -1,6 +1,6 @@
 NAME
 ====
-**slacube pedestal** - script for pedestal data.
+**slacube pedestal** - take and manage pedestal data
 
 SYNOPSIS
 ========
@@ -8,14 +8,14 @@ SYNOPSIS
 
 DESCRIPTION
 ===========
-**slacube pedestal** takes pedestal data and manages reference pedestal file. It also run QC tests to identify bad channels. The data-taking function is a wrapper of `pedestal_qc.py`. It works under `$SLACUBE_WORKDIR`.  For commands with _ped-file_, either providing a file path, or choosing from a interactive list of files under `$SLACUBE_WORKDIR`.
+**slacube pedestal** takes pedestal data and manages the reference pedestal file. It also runs a QC test to identify bad channels. The data-taking function is a wrapper of `pedestal_qc.py`. It works under `$SLACUBE_WORKDIR`, and `start`/`start-qc` require `$CTRL_FILE` and `$BAD_CHANNEL_FILE` to already be set. For commands with _ped-file_, either provide a file path or choose from an interactive list of files under `$SLACUBE_WORKDIR`.
 
 COMMAND
 =======
 start [-h] [_OPTIONS_]
-:   Take a pedestal run. Default runtime is 120 seconds (as of 2023-04-10). Additional _OPTIONS_ are pass through to `pedestal_qc.py`. See `slacube pedestal start -h`.
+:   Take a pedestal run. Default runtime is 120 seconds (as of 2023-04-10). Additional _OPTIONS_ are passed through to `pedestal_qc.py`. See `slacube pedestal start -h`.
 
-start_qc [-h] [_OPTIONS_]
+start-qc [-h] [_OPTIONS_]
 :   Perform a QC test on pedestal. Bad channels (mean ADC > 125, as of 2023-04-10) are marked.
 
 set [_ped-file_]
@@ -49,7 +49,7 @@ Set reference pedestal from a given file
    $ slacube pedestal set pedestal.h5
 ```
 
-Plot the mean and std of a pedestal file 
+Plot the mean and std of a pedestal file
 ```
    $ slacube pedestal plot pedestal.h5
 ```

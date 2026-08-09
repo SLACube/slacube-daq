@@ -1,6 +1,6 @@
 NAME
 ====
-**slacube rate-test** - QC test on trigger rate.
+**slacube rate-test** - QC test on trigger rate
 
 SYNOPSIS
 ========
@@ -8,12 +8,12 @@ SYNOPSIS
 
 DESCRIPTION
 ===========
-**slacube rate-test** identifies and masks the channels with high trigger rate.
+**slacube rate-test** identifies channels with anomalously high trigger rate. It works under `$SLACUBE_WORKDIR` and requires `$CTRL_FILE` and `$BAD_CHANNEL_FILE` to already be set.
 
 COMMAND
 =======
 start
-:   Perform a trigger rate test. Save an updated bad channel list under `$SLACUBE_WORKDIR`. It is a wrapper function for `trigger_rate_qc.py`.
+:   Run the trigger-rate test (a wrapper for `trigger_rate_qc.py`) and save the offending channels to a new `trigger-rate-DO-NOT-ENABLE-channel-list-<timestamp>.json` file under `$SLACUBE_WORKDIR`. This does **not** update `$BAD_CHANNEL_FILE` automatically — run `slacube bad-channel set` on the new file to make it the active bad-channel list.
 
 help
 :   Show this text.
@@ -32,7 +32,6 @@ ENVIRONMENT
 
 `$SLACUBE_WORKDIR`
 :   Current working directory. See `slacube env help`.
-
 
 SEE ALSO
 ========

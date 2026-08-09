@@ -1,6 +1,6 @@
 NAME
 ====
-**slacube run** - take data for a series of pedestal and self-triggered runs.
+**slacube run** - take data for a series of pedestal and self-triggered runs
 
 SYNOPSIS
 ========
@@ -49,8 +49,11 @@ ENVIRONMENT
 `$SLACUBE_DROPBOX`
 :   Destination for pedestal output; self-triggered output is queued via `nq` for conversion into the dropbox. See `slacube help`.
 
-`$NQDIR`, `$NQDONEDIR`, `$NQFAILDIR`
+`$NQDIR`
 :   Job queue used to convert and move self-triggered data in the background. See `slacube help`.
+
+`$NQDONEDIR`, `$NQFAILDIR`
+:   Exported alongside `$NQDIR` but currently unused: job files accumulate directly in `$NQDIR` regardless of exit status. See `tracker/issues/issue-007` and `slacube help`.
 
 SEE ALSO
 ========

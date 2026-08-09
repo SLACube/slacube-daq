@@ -1,6 +1,6 @@
 NAME
 ====
-**slacube threshold** - manage trigger threshold.
+**slacube threshold** - manage trigger threshold
 
 SYNOPSIS
 ========
@@ -21,8 +21,11 @@ set [_cfg_]
 copy
 :   Copy the current `$CFG_DIR` into a freshly named sibling directory and make that the active configuration. Requires `$CTRL_FILE`.
 
-adjust [global|trim] [_OPTIONS_]
-:   Adjust the active configuration's global or per-channel trim threshold. Requires `$CFG_DIR`.
+adjust global _delta_ [_chip-id_]
+:   Adjust the global threshold of one chip, or all chips if _chip-id_ is omitted, by the integer _delta_ (may be negative). Prompts for confirmation. Requires `$CFG_DIR`.
+
+adjust trim _delta_ _chip-id_ [_channel-list_]
+:   Adjust the per-channel trim threshold of _chip-id_ by the integer _delta_, for _channel-list_ (comma-separated, e.g. `3,7,12`) or all channels if omitted. Prompts for confirmation. Requires `$CFG_DIR`.
 
 plot [_cfg_]
 :   Plot the threshold configuration. Prompts for `VDDA` (default 1800 mV) and whether the data is cryogenic.
@@ -40,6 +43,16 @@ Start a room-temperature threshold search
 Start a cryogenic threshold search
 ```
    $ slacube threshold start --cryo
+```
+
+Adjust the global threshold of every chip by +1
+```
+   $ slacube threshold adjust global 1
+```
+
+Adjust the trim threshold of chip 1-1-19, channels 3 and 7, by -2
+```
+   $ slacube threshold adjust trim -2 1-1-19 3,7
 ```
 
 Set the active configuration from a directory
