@@ -222,9 +222,18 @@ def claim_job(spool_root, job_name):
 
     Returns the new running path, or None if the incoming entry is gone
     (race with another worker).
+
+    `running/` is created here rather than assumed to pre-exist: unlike
+    every other spool write, this is a plain `os.rename`, not
+    `atomic_write_json` (which self-heals its own directory). On a
+    freshly provisioned spool nothing else ever creates `running/`, so
+    without this the very first job submitted would hit ENOENT on the
+    rename and be silently swallowed below as "lost the race" -- it
+    never has a competitor to lose to.
     """
     src = job_record_path(spool_root, "incoming", job_name)
     dst = job_record_path(spool_root, "running", job_name)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
     try:
         os.rename(src, dst)
     except OSError as exc:

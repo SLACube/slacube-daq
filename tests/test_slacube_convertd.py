@@ -364,6 +364,32 @@ with tmp_layout() as L:
     again = convertd.claim_job(L["spool"], "raw_2026_02_21_21_52_18")
     check(again is None, "second claim returns None")
 
+# ---------------------------------------------------------- claim: fresh spool bootstrap
+# Regression: every spool write except claim_job goes through
+# atomic_write_json, which self-heals its own directory. claim_job used a
+# bare os.rename into running/, which nothing pre-creates in production
+# (tmp_layout() above pre-creates all four subdirs, masking this). On a
+# freshly provisioned spool -- running/ genuinely absent, not just empty --
+# the very first job submitted must still be claimable.
+print("\n[claim: fresh spool with no running/ dir yet (real bootstrap)]")
+fresh_root = tempfile.mkdtemp(prefix="slacube_test_fresh_")
+try:
+    fresh_spool = os.path.join(fresh_root, "spool")
+    fresh_dropbox = os.path.join(fresh_root, "dropbox")
+    fresh_workdir = os.path.join(fresh_root, "work")
+    os.makedirs(fresh_dropbox)
+    os.makedirs(fresh_workdir)
+    raw = os.path.join(fresh_workdir, "raw_2026_02_21_21_52_18.h5")
+    write_fake_raw(raw)
+    convertd.submit(raw, fresh_spool, fresh_dropbox)
+    check(not os.path.isdir(os.path.join(fresh_spool, "running")),
+          "precondition: running/ does not exist before the first claim")
+    claimed = convertd.claim_job(fresh_spool, "raw_2026_02_21_21_52_18")
+    check(claimed == os.path.join(fresh_spool, "running", "raw_2026_02_21_21_52_18.json"),
+          "claim succeeds against a spool where running/ never existed: %r" % (claimed,))
+finally:
+    shutil.rmtree(fresh_root, ignore_errors=True)
+
 # ---------------------------------------------------------- process happy
 print("\n[process happy path]")
 with tmp_layout() as L:
