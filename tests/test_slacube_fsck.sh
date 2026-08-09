@@ -16,6 +16,15 @@
 HERE=$(cd "$(dirname "$0")" && pwd)
 BIN_DIR=$(cd "$HERE/../bin" && pwd)
 
+# Found live during Round 3 Block B4: run from an operator shell that has
+# sourced a site file (the normal way to invoke this on a deployed host),
+# and ambient SLACUBE_DROPBOX/etc leak into the "missing env" checks below,
+# which only ever *add* vars via a command prefix and rely on the shell
+# being otherwise clean. Force that cleanliness instead of assuming it.
+for _v in $(compgen -v SLACUBE_ 2>/dev/null); do
+  unset "$_v"
+done
+
 export PATH="$BIN_DIR:$PATH"
 
 _failures=0
