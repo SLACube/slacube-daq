@@ -299,6 +299,70 @@ check $([[ "$out" == *"pull failed"* ]] && echo 1 || echo 0) "connection failure
 rm -rf "$fakebin" "$ROOT"
 
 
+# ---------------------------------------------------------- G10: pull backup-dir invariant
+echo
+echo "[G10: pull carries --backup/--backup-dir; never --inplace/--append/--append-verify/--delete]"
+eval "$(make_fixture)"
+seed_pool_tree "$SRC"
+real_rsync=$(command -v rsync)
+fakebin=$(mktemp -d)
+argv_log="$ROOT/rsync-argv.log"
+cat > "$fakebin/rsync" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$argv_log"
+exec "$real_rsync" "\$@"
+EOF
+chmod +x "$fakebin/rsync"
+backup_dir="$ROOT/backup"
+out=$(PATH="$fakebin:$PATH" SLACUBE_SYNC_SOURCE="$SRC/" SLACUBE_SYNC_DEST="$DST" \
+  SLACUBE_SYNC_BACKUP_DIR="$backup_dir" slacube-sync-pool 2>&1)
+rc=$?
+check $([[ $rc -eq 0 ]] && echo 1 || echo 0) "G10: pull under the recording rsync stub still exits 0"
+pull_line=$(sed -n '1p' "$argv_log")
+check $([[ "$pull_line" == *"--backup"* ]] && echo 1 || echo 0) "G10: pull argv carries --backup"
+check $([[ "$pull_line" == *"--backup-dir=$backup_dir"* ]] && echo 1 || echo 0) "G10: pull argv carries --backup-dir=\$SLACUBE_SYNC_BACKUP_DIR"
+for bad in inplace append append-verify delete; do
+  check $([[ "$pull_line" != *"--$bad"* ]] && echo 1 || echo 0) "G10: pull argv has no --$bad"
+done
+rm -rf "$fakebin" "$ROOT"
+
+
+# ---------------------------------------------------------- G10: pull backs up a replaced destination file
+echo
+echo "[G10: pull moves a replaced destination file into the backup dir instead of clobbering it]"
+eval "$(make_fixture)"
+seed_pool_tree "$SRC"
+mkdir -p "$DST/pool/selftrigger/2026/2026-08-01"
+printf 'OLD-CONTENT' > "$DST/pool/selftrigger/2026/2026-08-01/selftrigger_2026_08_01_10_00_00.h5"
+backup_dir="$ROOT/backup"
+out=$(SLACUBE_SYNC_SOURCE="$SRC/" SLACUBE_SYNC_DEST="$DST" \
+  SLACUBE_SYNC_BACKUP_DIR="$backup_dir" slacube-sync-pool 2>&1)
+rc=$?
+check $([[ $rc -eq 0 ]] && echo 1 || echo 0) "G10: pull over a pre-existing differing file exits 0"
+new_content=$(cat "$DST/pool/selftrigger/2026/2026-08-01/selftrigger_2026_08_01_10_00_00.h5" 2>/dev/null)
+check $([[ "$new_content" == "st-01-A" ]] && echo 1 || echo 0) "G10: destination now holds the new (source) content"
+backed_up="$backup_dir/pool/selftrigger/2026/2026-08-01/selftrigger_2026_08_01_10_00_00.h5"
+check $([[ -f "$backed_up" ]] && echo 1 || echo 0) "G10: pre-run destination copy preserved under the backup dir"
+check $([[ "$(cat "$backed_up" 2>/dev/null)" == "OLD-CONTENT" ]] && echo 1 || echo 0) "G10: backed-up file content matches the pre-run original"
+echo "$out" | grep -q 'WARNING' && check 1 "G10: a non-empty backup dir prints a loud warning" || check 0 "G10: a non-empty backup dir prints a loud warning"
+rm -rf "$ROOT"
+
+
+# ---------------------------------------------------------- G10: routine pull leaves no backup dir behind
+echo
+echo "[G10: a routine pull with nothing replaced leaves no backup dir and prints no warning]"
+eval "$(make_fixture)"
+seed_pool_tree "$SRC"
+backup_dir="$ROOT/backup"
+out=$(SLACUBE_SYNC_SOURCE="$SRC/" SLACUBE_SYNC_DEST="$DST" \
+  SLACUBE_SYNC_BACKUP_DIR="$backup_dir" slacube-sync-pool 2>&1)
+rc=$?
+check $([[ $rc -eq 0 ]] && echo 1 || echo 0) "G10: routine pull into an empty destination exits 0"
+check $([[ ! -e "$backup_dir" ]] && echo 1 || echo 0) "G10: empty backup dir was rmdir'd away"
+check $([[ "$out" != *"WARNING"* ]] && echo 1 || echo 0) "G10: routine pull stays silent (no WARNING)"
+rm -rf "$ROOT"
+
+
 # ---------------------------------------------------------- result
 echo
 echo "============================================================"

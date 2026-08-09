@@ -35,6 +35,13 @@
 #                           preserved: pass the destination WITHOUT a
 #                           trailing slash so the source's contents land
 #                           inside it.
+#   $SLACUBE_SYNC_BACKUP_DIR  Where the pull leg (G10) moves a
+#                           destination file aside before overwriting
+#                           it. Default
+#                           `dirname($SLACUBE_SYNC_DEST)/.sync-backup/<UTC
+#                           timestamp>`. This only relocates the backup;
+#                           there is no way to disable it -- the pull
+#                           must never silently replace a good file.
 #
 # Exit codes:
 #   0  success (pulled, verified, delete-step completed as requested)
@@ -60,7 +67,7 @@ for arg in "$@"; do
     --verbose)        VERBOSE=1 ;;
     --delete-source)  DELETE_SOURCE=1 ;;
     -h|--help)
-      sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,53p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -131,6 +138,19 @@ case "$DEST" in
   *)  DEST="$DEST/" ;;
 esac
 
+# G10: the destination is the ONLY copy of a large pool. --backup
+# --backup-dir makes rsync move a file the pull is about to REPLACE
+# aside instead of overwriting it in place, so a bad pull (truncated or
+# corrupt source) can never destroy a good destination file. BACKUP_DIR
+# must live outside $DEST -- inside it, the backed-up copies would be
+# re-scanned (and re-transferred, or worse, treated as deletion
+# candidates) on the very next run. There is deliberately no way to
+# turn this off: $SLACUBE_SYNC_BACKUP_DIR only relocates it (tests point
+# it at a local tempdir), it never disables it.
+UTC_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+DEFAULT_BACKUP_DIR="$(dirname "${DEST%/}")/.sync-backup/$UTC_STAMP"
+BACKUP_DIR="${SLACUBE_SYNC_BACKUP_DIR:-$DEFAULT_BACKUP_DIR}"
+
 # --- step 1: pull -------------------------------------------------------
 
 # Pull uses archive mode (no --checksum; we don't need byte-by-byte
@@ -145,9 +165,10 @@ esac
 # total summaries are ignored because step 3 deletes regular files
 # only -- directory pruning is left for an explicit, later decision).
 if [[ "$VERBOSE" -eq 1 ]]; then
-  log "pull: rsync -ai --exclude=raw $SOURCE $DEST"
+  log "pull: rsync -ai --backup --backup-dir=$BACKUP_DIR --exclude=raw $SOURCE $DEST"
 fi
-rsync_pull_out=$(rsync -ai --exclude='raw' --exclude='/raw' --exclude='/raw/' \
+rsync_pull_out=$(rsync -ai --backup --backup-dir="$BACKUP_DIR" \
+  --exclude='raw' --exclude='/raw' --exclude='/raw/' \
   "$SOURCE" "$DEST" 2>&1)
 rc=$?
 if [[ $rc -ne 0 ]]; then
@@ -160,6 +181,23 @@ if [[ "$VERBOSE" -eq 1 && -n "$rsync_pull_out" ]]; then
 fi
 pulled=$(printf '%s\n' "$rsync_pull_out" \
   | grep -E '^>f' | wc -l | tr -d ' ')
+
+# A non-empty $BACKUP_DIR after the pull means this run overwrote a
+# destination file that already existed -- i.e. the DAQ side re-sent
+# something S3DF already had. That is a finding, not routine
+# operation, so report it loudly and leave the evidence in place. An
+# empty (or never-created) backup dir is the routine case and must
+# stay silent, so remove it without complaint.
+backup_replaced=0
+if [[ -d "$BACKUP_DIR" ]]; then
+  backup_replaced=$(find "$BACKUP_DIR" -type f | wc -l | tr -d ' ')
+fi
+if [[ "$backup_replaced" -eq 0 ]]; then
+  rmdir "$BACKUP_DIR" 2>/dev/null || true
+else
+  printf '%s: WARNING: pull replaced %d file(s) already present at the destination; originals preserved under %s\n' \
+    "$PROGRAM" "$backup_replaced" "$BACKUP_DIR" >&2
+fi
 
 # --- step 2: verify -----------------------------------------------------
 
